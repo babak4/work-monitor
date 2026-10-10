@@ -24,6 +24,7 @@ import {
   ttlOptionOf,
   briefKey,
   heat,
+  hintLine,
   modelName,
   shortOf,
   subjectOf,
@@ -168,6 +169,11 @@ async function tick($: Dollar): Promise<void> {
 }
 
 /** Run work nobody awaits, and swallow its failure: a timer that fires after a reload must not leave a rejection behind. */
+/** The engine's own prompt hint line (mode, shortcuts), mirrored from its `PromptHint` site so the band can show it. */
+let hintText = ''
+/** Whether the band is drawing now. The engine's hint line is hidden only then, so the mode is never left unshown. */
+let bandShown = false
+
 const background = (work: Promise<unknown>): void => void work.catch(() => undefined)
 
 /** Texts whose brief is being written now; module-level, so a reload may ask once more, which is harmless. */
@@ -454,11 +460,28 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // The engine's hint line under the prompt (mode, shortcuts) moves into the band's header: mirrored here, drawn
+  // empty while the band is showing. Where the band is not showing (a survey, `/work` off) the engine's own line stays.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (e.props.hint !== hintText) {
+      hintText = e.props.hint
+      $.ui.invalidate('ui.render')
+    }
+    if (!bandShown) return next(e)
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  }).catch(($, e, next) => next(e))
+
   // The band above the prompt: a navy box whose border shows the state (orange working, green just
   // finished, red failed, muted when idle). One pressable row per agent, then the plan and quota.
   // It gives way to a survey and to `/work`, which toggles it.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await read($, hiddenA))) return next(e)
+    const hide = e.props.hasSurvey || (await read($, hiddenA))
+    if (hide === bandShown) {
+      bandShown = !hide
+      $.ui.invalidate('ui.render') // the prompt hint hides or returns with the band
+    }
+    if (hide) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const agents = Object.values(await read($, agentsA))
     const quotas = await read($, quotasA)
@@ -501,7 +524,12 @@ export const register: Register = (on, options) => {
     const leftLen = `${headIcon} Work monitor${running > 0 ? `  ${running} running` : '  idle'}`.length
     const rightBase = `${fmtTokens(totalTokens(total))} tok · ~${fmtUsd(estUsd)}`
     const ledgerLen = ledgerUsd !== null ? ` · ledger ${fmtUsd(ledgerUsd)}`.length : 0
-    const showLedger = ledgerUsd !== null && cols - leftLen - rightBase.length - ledgerLen >= 4
+    const MODE_MIN = 16
+    const roomFor = (right: number): number => cols - leftLen - right - 4
+    // The mode (the engine's hint) gets what is left; the ledger gives way before it does.
+    const showLedger = ledgerUsd !== null && roomFor(rightBase.length + ledgerLen) >= MODE_MIN
+    const modeRoom = roomFor(rightBase.length + (showLedger ? ledgerLen : 0))
+    const modeText = modeRoom >= MODE_MIN ? hintLine(hintText, modeRoom) : ''
 
     // Cache: the countdown bar and the fullest wording that fits beside the label (box: border and padding take 4).
     const cs = cacheStatus(cache, forcedTtl, now, prices)
@@ -543,6 +571,7 @@ export const register: Register = (on, options) => {
             {headIcon} Work monitor
             <Text color={C.dim}>{running > 0 ? `  ${running} running` : '  idle'}</Text>
           </Text>
+          {modeText ? <Text color={C.warn}>{modeText}</Text> : ''}
           <Text color={C.text}>
             {fmtTokens(totalTokens(total))} tok · <Text color={C.warn}>~{fmtUsd(estUsd)}</Text>
             {showLedger ? <Text color={C.dim}> · ledger {fmtUsd(ledgerUsd ?? 0)}</Text> : ''}

@@ -35,6 +35,7 @@ import {
   taskOf,
   nowOf,
   modelName,
+  hintLine,
   shortOf,
   subjectOf,
   briefKey,
@@ -396,4 +397,14 @@ test('modelName shows Claude models as Family+version', () => {
   expect(modelName('claude-opus-4-20250514')).toBe('Opus4')
   expect(modelName('claude-3-5-sonnet-20241022')).toBe('Sonnet3.5')
   expect(modelName('?')).toBe('?')
+})
+
+test('hintLine fits the engine hint into the room, dropping trailing parts first', () => {
+  const h = '▸▸ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage'
+  expect(hintLine(h, 100)).toBe(h)
+  expect(hintLine(h, 51)).toBe('▸▸ auto mode on (shift+tab to cycle) · ← for agents')
+  expect(hintLine(h, 40)).toBe('▸▸ auto mode on (shift+tab to cycle)')
+  expect(hintLine(h, 12)).toBe('▸▸ auto mod…')
+  expect(hintLine('  esc   to interrupt ', 40)).toBe('esc to interrupt')
+  expect(hintLine('', 10)).toBe('')
 })

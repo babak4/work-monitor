@@ -488,3 +488,13 @@ export function modelName(id: string): string {
   if (old?.[1] && old[3]) return `${family(old[3])}${v(old[1], old[2])}`
   return id
 }
+
+/**
+ * The engine's prompt hint line (`▸▸ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage`) as one line
+ * that fits `room`: whitespace collapsed, then trailing " · " parts dropped until it fits, else clipped.
+ */
+export function hintLine(hint: string, room: number): string {
+  const parts = hint.replace(/\s+/g, ' ').trim().split(' · ').filter(Boolean)
+  while (parts.length > 1 && parts.join(' · ').length > room) parts.pop()
+  return clipText(parts.join(' · '), Math.max(1, room))
+}

@@ -27,3 +27,20 @@ test('a narrow band still draws, wording shortened to fit', async $ => {
   expect(await ui.find({ key: 'cache-box' })).toBeDefined()
   await ui.unmount()
 })
+
+const HINT = (hint: string) =>
+  ({ plugin: 'work-monitor', component: 'PromptHint', surface: 'terminal', props: { isDraft: false, isWorking: false, hint } }) as const
+
+test("the engine's mode line moves into the band's header, and its own line under the prompt is drawn empty", async $ => {
+  const band = await $.ui.mount(BAND(20))
+  const hint = await $.ui.mount(HINT('▸▸ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage'))
+  await band.redraw()
+  const mode = await band.find({ type: 'Text', text: /auto mode on/ })
+  expect(mode?.text).toContain('auto mode on (shift+tab to cycle)')
+  expect(await hint.find({ type: 'Text', text: /auto mode on/ })).toBeUndefined()
+  await hint.redraw(HINT('▸▸ plan mode on (shift+tab to cycle)').props)
+  await band.redraw()
+  expect((await band.find({ type: 'Text', text: /mode on/ }))?.text).toContain('plan mode on')
+  await hint.unmount()
+  await band.unmount()
+})
