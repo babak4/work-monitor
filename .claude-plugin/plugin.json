@@ -26,6 +26,17 @@
       "title": "Price table (USD per million tokens)",
       "description": "JSON: {\"opus\":{\"in\":5,\"out\":25},\"sonnet\":{\"in\":3,\"out\":15}, ...}. Cache read is 0.1x input and cache write 1.25x unless given as cr/cw. Defaults are ASSUMPTIONS; edit them to your plan's real rates.",
       "default": ""
+    },
+    "cacheTtl": {
+      "type": "string",
+      "title": "Prompt cache lifetime",
+      "description": "How long a cached prompt lives after its last use. auto learns it from behaviour (assumes 5m until it sees a cache survive more than five minutes); set 5m or 1h to be exact. Claude Code sessions may use either.",
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ],
+      "default": "auto"
     }
   }
 }

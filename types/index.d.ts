@@ -26,6 +26,8 @@ export type AgentRow = {
   task?: string
 }
 export type PlanClock = { startedAt: number; baseDone: number; total: number }
+/** The main thread's prompt cache: when a request last touched it, what it holds, and the TTL once known. */
+export type CacheState = { lastAt: number; tokens: number; model: string; ttl: '5m' | '1h' | null }
 export type Quota = { kind: string; percentUsed: number; resetsAt?: string }
 
 declare module 'claude-code' {
@@ -39,6 +41,7 @@ declare module 'claude-code' {
       isHidden: boolean
       expanded: Record<string, boolean>
       planClock: PlanClock | null
+      cache: CacheState | null
     }
   }
 }
