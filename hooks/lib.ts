@@ -1,4 +1,4 @@
-import type { AgentRow, AgentStatus, CacheState, PlanClock, Todo, Tokens } from '../types'
+import type { AgentRow, AgentStatus, BgTask, CacheState, PlanClock, Todo, Tokens } from '../types'
 
 export type Price = { in: number; out: number; cr?: number; cw?: number }
 export type PriceTable = Record<string, Price>
@@ -138,10 +138,11 @@ export const BOXED_MIN_ROWS = 14
 
 /**
  * Rows the band spends before any agent: the border (2), the header (1), the cache and quota (a
- * 3-row box each, or 1 plain line each when short), and the plan and Task lines when present.
+ * 3-row box each, or 1 plain line each when short), the plan and Task lines when present, and the
+ * background rows (their header included) when any.
  */
-export const bandFixedRows = (o: { boxed: boolean; hasPlan: boolean; hasTask: boolean }): number =>
-  2 + 1 + (o.boxed ? 6 : 2) + (o.hasPlan ? 1 : 0) + (o.hasTask ? 1 : 0)
+export const bandFixedRows = (o: { boxed: boolean; hasPlan: boolean; hasTask: boolean; backgroundRows?: number }): number =>
+  2 + 1 + (o.boxed ? 6 : 2) + (o.hasPlan ? 1 : 0) + (o.hasTask ? 1 : 0) + (o.backgroundRows ?? 0)
 
 /**
  * How many agents fit in `maxRows` once `fixedRows` are spent. `costs` is the height of each agent in
@@ -407,4 +408,92 @@ export function cacheText(s: CacheStatus, maxChars: number): string {
         ? [`expired · next request re-caches ${tok} tok · ~${usd} extra`, `expired · ~${usd} extra`, 'expired']
         : [`may have expired (TTL unknown) · ~${usd} extra if so`, `may be expired · ~${usd} extra`, 'may be expired']
   return variants.find(v => v.length <= maxChars) ?? variants[variants.length - 1] ?? ''
+}
+
+const isTodoStatus = (s: unknown): s is Todo['status'] => s === 'pending' || s === 'in_progress' || s === 'completed'
+const text = (v: unknown): string => (typeof v === 'string' ? v : '')
+
+/**
+ * The newer task tools (TaskCreate, TaskUpdate, TaskList) change one task per call, and the id comes
+ * back in the result, so the list is rebuilt from the calls. TodoWrite sends the whole list instead.
+ */
+export function applyTaskCreate(todos: readonly Todo[], created: { id: string; subject: string }, input: { activeForm?: unknown }): Todo[] {
+  if (todos.some(t => t.id === created.id)) return [...todos]
+  const activeForm = text(input.activeForm)
+  return [...todos, { id: created.id, content: created.subject, status: 'pending', ...(activeForm ? { activeForm } : {}) }]
+}
+
+/** A TaskUpdate: `deleted` removes the task; anything else changes only what the call names. An unknown id is ignored. */
+export function applyTaskUpdate(
+  todos: readonly Todo[],
+  input: { taskId: string; subject?: unknown; activeForm?: unknown; status?: unknown },
+): Todo[] {
+  if (input.status === 'deleted') return todos.filter(t => t.id !== input.taskId)
+  return todos.map(t =>
+    t.id !== input.taskId
+      ? t
+      : {
+          ...t,
+          content: text(input.subject) || t.content,
+          status: isTodoStatus(input.status) ? input.status : t.status,
+          ...(text(input.activeForm) || t.activeForm ? { activeForm: text(input.activeForm) || t.activeForm } : {}),
+        },
+  )
+}
+
+/** A TaskList result is the whole list again: take its order and statuses, keep the activeForm we already knew. */
+export function applyTaskList(todos: readonly Todo[], tasks: ReadonlyArray<{ id: string; subject: string; status?: string }>): Todo[] {
+  const known = new Map(todos.map(t => [t.id, t] as const))
+  return tasks.map(x => {
+    const activeForm = known.get(x.id)?.activeForm
+    return { id: x.id, content: x.subject, status: isTodoStatus(x.status) ? x.status : 'pending', ...(activeForm ? { activeForm } : {}) }
+  })
+}
+
+const FINISHED = /^(completed|complete|done|failed|killed|stopped|cancelled|canceled|error)$/i
+
+/** A background task's label: its description's first line, clipped; never its command line. */
+export function bgLabelOf(description: string, kind: string): string {
+  const first = description.split('\n').find(l => l.trim() !== '')?.replace(/\s+/g, ' ').trim() ?? ''
+  return first ? clipText(first, 60) : kind
+}
+
+/** A shell or monitor started in the background (from a tool result), before any snapshot lists it. */
+export function noteBackground(
+  prev: Readonly<Record<string, BgTask>>,
+  t: { id: string; kind: string; label: string },
+  now: number,
+): Record<string, BgTask> {
+  return prev[t.id] ? { ...prev } : { ...prev, [t.id]: { id: t.id, kind: t.kind, label: t.label, status: 'running', startedAt: now } }
+}
+
+/**
+ * Reconcile with the engine's own list of running background tasks (what a Stop hook is given): listed
+ * ones are running, known ones no longer listed have finished. Finished ones go after `keepMs`.
+ */
+export function syncBackground(
+  prev: Readonly<Record<string, BgTask>>,
+  snapshot: ReadonlyArray<{ id: string; type: string; status: string; description: string }>,
+  now: number,
+  keepMs = 60_000,
+): Record<string, BgTask> {
+  const next: Record<string, BgTask> = { ...prev }
+  const live = new Set<string>()
+  for (const t of snapshot) {
+    if (FINISHED.test(t.status)) continue
+    live.add(t.id)
+    next[t.id] = { id: t.id, kind: t.type, label: bgLabelOf(t.description, t.type), status: 'running', startedAt: prev[t.id]?.startedAt ?? now }
+  }
+  for (const [id, b] of Object.entries(next)) {
+    if (b.status === 'running' && !live.has(id)) next[id] = { ...b, status: 'done', endedAt: now }
+    else if (b.status === 'done' && now - (b.endedAt ?? now) > keepMs) delete next[id]
+  }
+  return next
+}
+
+/** Rows for the band: running first, then recently finished; subagents are agents and show there instead. */
+export function backgroundRows(all: Readonly<Record<string, BgTask>>): BgTask[] {
+  return Object.values(all)
+    .filter(b => b.kind !== 'subagent')
+    .sort((a, b) => (a.status === b.status ? b.startedAt - a.startedAt : a.status === 'running' ? -1 : 1))
 }

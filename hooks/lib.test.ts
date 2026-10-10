@@ -17,6 +17,13 @@ import {
   toolRowModeOf,
   isQuietGroup,
   fitAgentRows,
+  applyTaskCreate,
+  applyTaskUpdate,
+  applyTaskList,
+  bgLabelOf,
+  noteBackground,
+  syncBackground,
+  backgroundRows,
   bandFixedRows,
   BOXED_MIN_ROWS,
   ttlOptionOf,
@@ -147,6 +154,7 @@ test('bandFixedRows counts the border, header, boxes or lines, plan and task', (
   expect(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true })).toBe(11)
   expect(bandFixedRows({ boxed: false, hasPlan: false, hasTask: false })).toBe(5)
   expect(bandFixedRows({ boxed: false, hasPlan: true, hasTask: true })).toBe(7)
+  expect(bandFixedRows({ boxed: true, hasPlan: false, hasTask: false, backgroundRows: 3 })).toBe(12)
   expect(BOXED_MIN_ROWS).toBeGreaterThan(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true }) + 2)
 })
 
@@ -328,4 +336,72 @@ test('cacheText picks the fullest wording that fits, after the Cache label', () 
   expect(cacheText(gone, 30)).toBe('expired · ~$1.15 extra')
   expect(cacheText(cacheStatus({ lastAt: 0.5, tokens: 1, model: 'x', ttl: null }, null, 0.5 + 400_000), 200)).toContain('TTL unknown')
   expect(cacheText({ kind: 'none' }, 10)).toBe('no reading yet')
+})
+
+test('TaskCreate then TaskUpdate rebuild the todo list, one task per call', () => {
+  let t = applyTaskCreate([], { id: '1', subject: 'Write tests' }, { activeForm: 'Writing tests' })
+  t = applyTaskCreate(t, { id: '2', subject: 'Ship it' }, {})
+  expect(t).toEqual([
+    { id: '1', content: 'Write tests', status: 'pending', activeForm: 'Writing tests' },
+    { id: '2', content: 'Ship it', status: 'pending' },
+  ])
+  expect(applyTaskCreate(t, { id: '1', subject: 'again' }, {})).toEqual(t)
+  t = applyTaskUpdate(t, { taskId: '1', status: 'in_progress' })
+  expect(t[0]?.status).toBe('in_progress')
+  expect(t[0]?.activeForm).toBe('Writing tests')
+  t = applyTaskUpdate(t, { taskId: '2', subject: 'Ship it today', activeForm: 'Shipping', status: 'completed' })
+  expect(t[1]).toEqual({ id: '2', content: 'Ship it today', status: 'completed', activeForm: 'Shipping' })
+  expect(applyTaskUpdate(t, { taskId: '9', status: 'completed' })).toEqual(t)
+  expect(applyTaskUpdate(t, { taskId: '1', status: 'bogus' })[0]?.status).toBe('in_progress')
+  expect(applyTaskUpdate(t, { taskId: '1', status: 'deleted' }).map(x => x.id)).toEqual(['2'])
+})
+
+test('a TaskList result replaces the list and keeps the activeForm already known', () => {
+  const known = [{ id: '1', content: 'a', status: 'pending' as const, activeForm: 'Doing a' }]
+  const out = applyTaskList(known, [
+    { id: '1', subject: 'a', status: 'completed' },
+    { id: '2', subject: 'b', status: 'in_progress' },
+    { id: '3', subject: 'c' },
+  ])
+  expect(out).toEqual([
+    { id: '1', content: 'a', status: 'completed', activeForm: 'Doing a' },
+    { id: '2', content: 'b', status: 'in_progress' },
+    { id: '3', content: 'c', status: 'pending' },
+  ])
+  expect(applyTaskList(out, [])).toEqual([])
+})
+
+test('background labels use the description, never a command', () => {
+  expect(bgLabelOf('Run the test suite\nnpm test --watch', 'shell')).toBe('Run the test suite')
+  expect(bgLabelOf('', 'monitor')).toBe('monitor')
+  expect(bgLabelOf('x'.repeat(100), 'shell').length).toBe(60)
+})
+
+test('background tasks are noted at start, reconciled by the engine snapshot, and expire once finished', () => {
+  const started = noteBackground({}, { id: 'b1', kind: 'shell', label: 'Run tests' }, 1_000)
+  expect(started.b1).toEqual({ id: 'b1', kind: 'shell', label: 'Run tests', status: 'running', startedAt: 1_000 })
+  expect(noteBackground(started, { id: 'b1', kind: 'shell', label: 'other' }, 9_000).b1?.startedAt).toBe(1_000)
+
+  const snap = [
+    { id: 'b1', type: 'shell', status: 'running', description: 'Run tests' },
+    { id: 'm1', type: 'monitor', status: 'running', description: 'Watch the log' },
+    { id: 'z', type: 'shell', status: 'completed', description: 'old' },
+  ]
+  const synced = syncBackground(started, snap, 5_000)
+  expect(Object.keys(synced).sort()).toEqual(['b1', 'm1'])
+  expect(synced.b1?.startedAt).toBe(1_000)
+  expect(synced.m1?.startedAt).toBe(5_000)
+
+  const later = syncBackground(synced, [{ id: 'm1', type: 'monitor', status: 'running', description: 'Watch the log' }], 8_000)
+  expect(later.b1).toMatchObject({ status: 'done', endedAt: 8_000 })
+  expect(syncBackground(later, [], 8_000 + 70_000).b1).toBeUndefined()
+})
+
+test('backgroundRows lists running first and leaves subagents to the agent rows', () => {
+  const all = {
+    a: { id: 'a', kind: 'shell', label: 'a', status: 'done' as const, startedAt: 1 },
+    b: { id: 'b', kind: 'monitor', label: 'b', status: 'running' as const, startedAt: 2 },
+    c: { id: 'c', kind: 'subagent', label: 'c', status: 'running' as const, startedAt: 3 },
+  }
+  expect(backgroundRows(all).map(x => x.id)).toEqual(['b', 'a'])
 })

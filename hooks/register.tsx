@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, AgentStatus, CacheState, PlanClock, Quota, Todo } from '../types'
+import type { AgentRow, AgentStatus, BgTask, CacheState, PlanClock, Quota, Seen, Todo } from '../types'
 import {
   addTokens,
   costUsd,
@@ -13,6 +13,11 @@ import {
   fmtUsd,
   BOXED_MIN_ROWS,
   bandFixedRows,
+  applyTaskCreate,
+  applyTaskList,
+  applyTaskUpdate,
+  bgLabelOf,
+  backgroundRows,
   bandState,
   cacheStatus,
   cacheText,
@@ -22,6 +27,8 @@ import {
   etaMs,
   fitAgentRows,
   heat,
+  noteBackground,
+  syncBackground,
   isAwaitingFirstReading,
   nowOf,
   quietOf,
@@ -53,6 +60,8 @@ const checklistA = atom({ plugin: 'work-monitor', key: 'checklist' } as const, [
 const nowA = atom({ plugin: 'work-monitor', key: 'now' } as const, 0)
 const hiddenA = atom({ plugin: 'work-monitor', key: 'isHidden' } as const, false)
 const expandedA = atom({ plugin: 'work-monitor', key: 'expanded' } as const, {} as Record<string, boolean>)
+const backgroundA = atom({ plugin: 'work-monitor', key: 'background' } as const, {} as Record<string, BgTask>)
+const seenA = atom({ plugin: 'work-monitor', key: 'seen' } as const, { tools: {}, spawns: 0 } as Seen)
 const cacheA = atom({ plugin: 'work-monitor', key: 'cache' } as const, null as CacheState | null)
 const planClockA = atom({ plugin: 'work-monitor', key: 'planClock' } as const, null as PlanClock | null)
 
@@ -147,8 +156,8 @@ async function refresh($: Dollar, planFile: string): Promise<void> {
     await update($, agentsA, (all: Record<string, AgentRow>) => {
       const next = { ...all }
       for (const info of infos) {
-        const row = next[info.id]
-        if (!row) continue
+        // An agent no event told us about (a forked skill, a background agent) still gets a row.
+        const row = next[info.id] ?? fresh(info.id, info.description || `agent ${info.id.slice(0, 8)}`, now)
         const status = mapStatus(info.status)
         next[info.id] = {
           ...row,
@@ -181,6 +190,69 @@ async function tick($: Dollar): Promise<void> {
   await update($, nowA, () => now)
 }
 
+/** After a tool ran: keep the todo list from the Task tools, and note a shell started in the background. */
+async function learnFromResult(
+  $: Dollar,
+  id: string,
+  tool: string,
+  input: Record<string, unknown>,
+  out: { result?: unknown; isError?: unknown },
+): Promise<void> {
+  const r = out.result as Record<string, unknown> | undefined
+  if (!r || out.isError) return // a refusal or an error changed nothing
+  const setTodos = async (change: (todos: Todo[]) => Todo[]): Promise<void> => {
+    await touch($, id, row => ({ ...row, todos: change(row.todos) }))
+    await syncPlan($)
+  }
+  if (tool === 'TaskCreate') {
+    const task = r.task as { id?: unknown; subject?: unknown } | undefined
+    if (typeof task?.id === 'string' && typeof task.subject === 'string') {
+      const created = { id: task.id, subject: task.subject }
+      await setTodos(todos => applyTaskCreate(todos, created, input))
+    }
+  } else if (tool === 'TaskUpdate') {
+    if (r.success !== false && typeof input.taskId === 'string') {
+      const upd = { taskId: input.taskId, subject: input.subject, activeForm: input.activeForm, status: input.status }
+      await setTodos(todos => applyTaskUpdate(todos, upd))
+    }
+  } else if (tool === 'TaskList') {
+    if (Array.isArray(r.tasks)) {
+      const tasks = r.tasks as Array<{ id: string; subject: string; status?: string }>
+      await setTodos(todos => applyTaskList(todos, tasks))
+    }
+  } else if (tool === 'Bash' && typeof r.backgroundTaskId === 'string') {
+    const started = { id: r.backgroundTaskId, kind: 'shell', label: bgLabelOf(typeof input.description === 'string' ? input.description : '', 'shell') }
+    const now = await $.clock.now()
+    await update($, backgroundA, prev => noteBackground(prev, started, now))
+  }
+}
+
+/** What the mod has seen, as plain text for `/work debug`: no commands, paths or tokens, only names and counts. */
+async function debugReport($: Dollar): Promise<string> {
+  const agents = Object.values(await read($, agentsA))
+  const seen = await read($, seenA)
+  const bg = Object.values(await read($, backgroundA))
+  const cache = await read($, cacheA)
+  const lines: string[] = ['work-monitor debug']
+  let listed = 'unavailable'
+  try {
+    listed = String((await $.agent.list()).length)
+  } catch {
+    /* best effort */
+  }
+  lines.push(`agents tracked: ${agents.length} (engine lists ${listed}); subagent spawns seen: ${seen.spawns}`)
+  for (const a of agents) {
+    lines.push(
+      `  ${a.isMain ? 'main' : a.id.slice(0, 8)} · ${a.status} · ${a.type} · steps ${a.steps} · tool calls ${a.toolCalls} · todos ${a.todos.length} · model ${a.model}`,
+    )
+  }
+  const tools = Object.entries(seen.tools).sort((x, y) => y[1] - x[1])
+  lines.push(`tools seen: ${tools.length ? tools.map(([n, c]) => `${n} ${c}`).join(', ') : 'none yet'}`)
+  lines.push(`background tasks: ${bg.length ? bg.map(b => `${b.kind} ${b.status}`).join(', ') : 'none'}`)
+  lines.push(`cache: ${cache ? `${cache.tokens} tokens, ttl ${cache.ttl ?? 'unknown'}` : 'no reading yet'}`)
+  return lines.join('\n')
+}
+
 export const register: Register = (on, options) => {
   const prices = parsePrices(options.prices)
   const toolRows = toolRowModeOf(options.toolRows)
@@ -196,7 +268,8 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'work' }, async $ => {
+  on('command.run', { command: 'work' }, async ($, e) => {
+    if (e.args.trim() === 'debug') return { text: await debugReport($) }
     const isHidden = await update($, hiddenA, h => !h)
     await refresh($, planFile)
     return { text: isHidden ? 'Work monitor hidden.' : 'Work monitor shown.' }
@@ -205,6 +278,7 @@ export const register: Register = (on, options) => {
   on('agent.spawn', async ($, e, next) => {
     const result = await next(e)
     try {
+      await update($, seenA, seen => ({ ...seen, spawns: seen.spawns + 1 }))
       if (result.agentId) {
         const id = result.agentId
         const now = await $.clock.now()
@@ -325,15 +399,12 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    const id = e.agentId ?? MAIN
+    const input = e as unknown as Record<string, unknown>
     try {
-      const id = e.agentId ?? MAIN
       const todos =
-        e.tool === 'TodoWrite' && Array.isArray((e as { todos?: unknown }).todos)
-          ? (e as unknown as { todos: Todo[] }).todos.map(t => ({
-              content: t.content,
-              status: t.status,
-              activeForm: t.activeForm,
-            }))
+        e.tool === 'TodoWrite' && Array.isArray(input.todos)
+          ? (input.todos as Todo[]).map(t => ({ content: t.content, status: t.status, activeForm: t.activeForm }))
           : null
       await touch($, id, (row, now) => ({
         ...row,
@@ -343,9 +414,28 @@ export const register: Register = (on, options) => {
         doing: doingOf(e.tool, e),
         activityAt: now,
       }))
+      await update($, seenA, seen => ({ ...seen, tools: { ...seen.tools, [e.tool]: (seen.tools[e.tool] ?? 0) + 1 } }))
       if (todos) await syncPlan($)
     } catch {
       /* a monitor never fails a tool call */
+    }
+    const out = await next(e)
+    try {
+      await learnFromResult($, id, e.tool, input, out as { result?: unknown; isError?: unknown })
+    } catch {
+      /* nor does it fail on a result it cannot read */
+    }
+    return out
+  }).catch(($, e, next) => next(e))
+
+  // The engine's own list of running background tasks (shells, monitors, workflows), given to a Stop hook
+  // at the end of every turn: the one authoritative view, so it reconciles whatever we noted earlier.
+  on('classic.Stop', async ($, e, next) => {
+    try {
+      const now = await $.clock.now()
+      await update($, backgroundA, prev => syncBackground(prev, e.background_tasks ?? [], now))
+    } catch {
+      /* a monitor never fails a stop */
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -363,6 +453,7 @@ export const register: Register = (on, options) => {
     const planClock = await read($, planClockA)
     const cache = await read($, cacheA)
     const expanded = await read($, expandedA)
+    const bgAll = backgroundRows(await read($, backgroundA))
     const now = (await read($, nowA)) || 0
 
     const width = Math.max(40, e.props.bodyColumns)
@@ -390,10 +481,11 @@ export const register: Register = (on, options) => {
     const task = agents.find(a => a.isMain)?.task
     // Cache and quota are boxes of their own when the band is tall enough, plain lines when it is short.
     const boxed = e.props.maxRows >= BOXED_MIN_ROWS
+    const bgShown = Math.min(bgAll.length, 3)
     const shown = fitAgentRows(
       e.props.maxRows,
       sorted.map(a => 2 + (details.get(a.id)?.length ?? 0)),
-      bandFixedRows({ boxed, hasPlan: planFraction !== null, hasTask: Boolean(task) }),
+      bandFixedRows({ boxed, hasPlan: planFraction !== null, hasTask: Boolean(task), backgroundRows: bgShown ? bgShown + 1 : 0 }),
     )
     const barW = Math.min(12, Math.max(6, Math.floor(cols / 10)))
     const labelW = Math.max(12, Math.min(28, Math.floor(cols / 4)))
@@ -476,7 +568,9 @@ export const register: Register = (on, options) => {
           const pct = `${(p.fraction * 100).toFixed(0)}%${p.isEstimate ? '~' : ''}`.padStart(5)
           const head = `${open ? '▾' : '▸'}${glyph} ${clip(a.label, labelW).padEnd(labelW)} `
           const meta = isAwaitingFirstReading(a)
-            ? ` waiting for first response… ${elapsed}`
+            ? a.isMain
+              ? ` waiting for first response… ${elapsed}`
+              : ` ${clip(a.type, 18)} · ${elapsed}`
             : ` ${clip(`${a.model}·${a.effort}`, 18).padEnd(18)} ${fmtTokens(totalTokens(a.tokens)).padStart(6)} ~${fmtUsd(costUsd(a.model, a.tokens, prices))} ${elapsed}`
           const quiet = quietOf(now, a.activityAt, a.status)
           const lineColor = a.status === 'failed' ? C.bad : a.status === 'running' ? C.text : C.dim
@@ -508,6 +602,20 @@ export const register: Register = (on, options) => {
           )
         })}
         {sorted.length > shown && <Text color={C.dim}>  … {sorted.length - shown} more (press a row to fold it)</Text>}
+
+        {bgShown > 0 && (
+          <Box key="background" flexDirection="column">
+            <Text bold color={ORANGE}>Background</Text>
+            {bgAll.slice(0, bgShown).map(b => (
+              <Text key={`bg-${b.id}`} color={b.status === 'running' ? C.run : C.dim} wrap="truncate-end">
+                {'  '}
+                {b.status === 'running' ? spin : '✓'} {b.kind} · {b.label} · {fmtDuration((b.endedAt ?? now) - b.startedAt)}
+                {b.status === 'done' ? ' · finished' : ''}
+              </Text>
+            ))}
+            {bgAll.length > bgShown && <Text color={C.dim}>  … {bgAll.length - bgShown} more</Text>}
+          </Box>
+        )}
 
         {planFraction !== null && (
           <Text color={C.text} wrap="truncate-end">
