@@ -23,6 +23,8 @@ A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work 
   command; subagents, including background ones, are rows like any other agent;
 - the remaining rate-limit **quota** for the current windows, in a box of its own at the bottom, coloured red-amber-green
   by how much is left ;
+- the engine's **mode line** (`auto mode on (shift+tab to cycle) · …`) in the middle of the header, moved up from under
+  the prompt (the engine's own line returns whenever the band is not showing);
 - the **Task box** (blue border): the current task and every agent, each as a short commit-style subject (a small
   model, Haiku, rewrites long prompts and sentences; a local shortener shows until it answers), five lines at a time; ▲ up / ▼ down (or k / j
   with the band focused) scroll it, so the band keeps a fixed height;

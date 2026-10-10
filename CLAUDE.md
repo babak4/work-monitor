@@ -81,6 +81,12 @@ unit-tested, so new logic goes there and `register.tsx` stays wiring and JSX.
   hotkeys k / j when the band is focused; `taskScroll` holds the offset, `scrollWindow` clamps it), so the band's
   height never changes. Each
   agent row is a `Button` that toggles `expanded`.
+- **Prompt hint → header.** The engine's line under the prompt (`auto mode on (shift+tab to cycle) · …`) is the
+  `PromptHint` site. Its text is mirrored into the module variable `hintText` (a render hook cannot write `$.state`)
+  and shown in the band's header by `hintLine`, so it is always the engine's own live string, never a guess from
+  `permission_mode`. The hint is drawn empty only while `bandShown`; with a survey up or `/work` off the engine's line
+  stays, so the mode is never missing. The `main / general-purpose …` agent list under it is not a hookable component
+  (see `RenderComponent`): the mod cannot hide or move it.
 - **Transcript hooks.** `ToolUse`, `ToolResult`, `ToolGroup` and `ToolProgress` return an empty `Box` (a dim line in
   `compact` mode) unless the call errored or was interrupted. The permission dialog is drawn by the engine alone and
   cannot be touched.
