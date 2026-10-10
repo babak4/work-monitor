@@ -25,7 +25,6 @@ export type AgentRow = {
   /** The main session only: the prompt it is working on, first line. */
   task?: string
 }
-export type PlanClock = { startedAt: number; baseDone: number; total: number }
 /** The main thread's prompt cache: when a request last touched it, what it holds, and the TTL once known. */
 export type CacheState = { lastAt: number; tokens: number; model: string; ttl: '5m' | '1h' | null }
 /** Something running in the background: a shell, a monitor, a workflow. Subagents are agents, not these. */
@@ -40,13 +39,13 @@ declare module 'claude-code' {
       agents: Record<string, AgentRow>
       quotas: Quota[]
       sessionUsd: number | null
-      checklist: Todo[]
       now: number
       isHidden: boolean
       expanded: Record<string, boolean>
-      planClock: PlanClock | null
       cache: CacheState | null
       background: Record<string, BgTask>
+      taskScroll: number
+      briefs: Record<string, string>
       seen: Seen
     }
   }

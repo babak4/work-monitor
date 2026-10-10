@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentRow, AgentStatus, BgTask, CacheState, PlanClock, Quota, Seen, Todo } from '../types'
+import type { AgentRow, AgentStatus, BgTask, CacheState, Quota, Seen, Todo } from '../types'
 import {
   addTokens,
   costUsd,
@@ -11,8 +11,6 @@ import {
   fmtReset,
   fmtTokens,
   fmtUsd,
-  BOXED_MIN_ROWS,
-  bandFixedRows,
   applyTaskCreate,
   applyTaskList,
   applyTaskUpdate,
@@ -24,28 +22,27 @@ import {
   contextTokensOf,
   inferTtl,
   ttlOptionOf,
-  etaMs,
-  fitAgentRows,
+  briefKey,
   heat,
+  modelName,
+  shortOf,
+  subjectOf,
   noteBackground,
+  scrollWindow,
   syncBackground,
   isAwaitingFirstReading,
   nowOf,
   quietOf,
   sayingOf,
   taskOf,
-  planOf,
   smoothBar,
   spinnerFrame,
-  trackPlan,
   isQuietGroup,
   toolRowModeOf,
-  parseChecklist,
   parsePrices,
   progressOf,
   quotaLabel,
   shouldCompactToolRow,
-  todoFraction,
   totalTokens,
 } from './lib'
 
@@ -56,18 +53,21 @@ const FAST_MS = 500 // the spinner and elapsed times; only while something runs
 const agentsA = atom({ plugin: 'work-monitor', key: 'agents' } as const, {} as Record<string, AgentRow>)
 const quotasA = atom({ plugin: 'work-monitor', key: 'quotas' } as const, [] as Quota[])
 const usdA = atom({ plugin: 'work-monitor', key: 'sessionUsd' } as const, null as number | null)
-const checklistA = atom({ plugin: 'work-monitor', key: 'checklist' } as const, [] as Todo[])
 const nowA = atom({ plugin: 'work-monitor', key: 'now' } as const, 0)
 const hiddenA = atom({ plugin: 'work-monitor', key: 'isHidden' } as const, false)
 const expandedA = atom({ plugin: 'work-monitor', key: 'expanded' } as const, {} as Record<string, boolean>)
+const taskScrollA = atom({ plugin: 'work-monitor', key: 'taskScroll' } as const, 0)
+/** Lines the Task box shows at once; the rest scroll. */
+const TASK_ROWS = 5
+const briefsA = atom({ plugin: 'work-monitor', key: 'briefs' } as const, {} as Record<string, string>)
 const backgroundA = atom({ plugin: 'work-monitor', key: 'background' } as const, {} as Record<string, BgTask>)
 const seenA = atom({ plugin: 'work-monitor', key: 'seen' } as const, { tools: {}, spawns: 0 } as Seen)
 const cacheA = atom({ plugin: 'work-monitor', key: 'cache' } as const, null as CacheState | null)
-const planClockA = atom({ plugin: 'work-monitor', key: 'planClock' } as const, null as PlanClock | null)
 
 // Navy band palette: every Text sets one of these, none relies on the terminal's default colour.
 const NAVY = '#0b1f4b'
 const ORANGE = '#ff8c1a'
+const BLUE = '#4ea1ff'
 const C = {
   text: '#f2f6ff',
   dim: '#a9bbe0',
@@ -88,15 +88,6 @@ function detailOf(a: AgentRow, cols: number): { text: string; color: string }[] 
       color: C.dim,
     },
   ]
-  if (a.todos.length === 0) return [...lines, { text: 'no todo list', color: C.dim }]
-  for (const t of a.todos.slice(0, 5)) {
-    const mark = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▶' : '☐'
-    lines.push({
-      text: `${mark} ${clip(t.content, cols - 8)}`,
-      color: t.status === 'in_progress' ? C.run : t.status === 'completed' ? C.done : C.text,
-    })
-  }
-  if (a.todos.length > 5) lines.push({ text: `… ${a.todos.length - 5} more`, color: C.dim })
   return lines
 }
 
@@ -133,15 +124,7 @@ async function touch($: Dollar, id: string, patch: (row: AgentRow, now: number) 
   })
 }
 
-/** Keep the plan's pace clock current: the ETA is measured from when the plan last changed shape. */
-async function syncPlan($: Dollar): Promise<void> {
-  const plan = planOf(await read($, checklistA), (await read($, agentsA))[MAIN])
-  const done = plan.filter(t => t.status === 'completed').length
-  const now = await $.clock.now()
-  await update($, planClockA, prev => trackPlan(prev, done, plan.length, now))
-}
-
-async function refresh($: Dollar, planFile: string): Promise<void> {
+async function refresh($: Dollar): Promise<void> {
   const now = await $.clock.now()
   await update($, nowA, () => now)
   try {
@@ -159,6 +142,7 @@ async function refresh($: Dollar, planFile: string): Promise<void> {
         // An agent no event told us about (a forked skill, a background agent) still gets a row.
         const row = next[info.id] ?? fresh(info.id, info.description || `agent ${info.id.slice(0, 8)}`, now)
         const status = mapStatus(info.status)
+        background(brief($, info.description))
         next[info.id] = {
           ...row,
           label: info.description || row.label,
@@ -172,13 +156,6 @@ async function refresh($: Dollar, planFile: string): Promise<void> {
   } catch {
     /* agent list is best effort */
   }
-  try {
-    const text = (await $.fs.read(planFile)) as string
-    await update($, checklistA, () => parseChecklist(text))
-  } catch {
-    /* no plan file */
-  }
-  await syncPlan($)
   $.ui.invalidate('ui.render')
 }
 
@@ -188,6 +165,43 @@ async function tick($: Dollar): Promise<void> {
   if (!agents.some(a => a.status === 'running')) return
   const now = await $.clock.now()
   await update($, nowA, () => now)
+}
+
+/** Run work nobody awaits, and swallow its failure: a timer that fires after a reload must not leave a rejection behind. */
+const background = (work: Promise<unknown>): void => void work.catch(() => undefined)
+
+/** Texts whose brief is being written now; module-level, so a reload may ask once more, which is harmless. */
+const briefing = new Set<string>()
+
+/**
+ * Have a small model rewrite a long text (a prompt, an agent's description, the sentence it just wrote) as a
+ * commit-message subject. The band shows `shortOf` until the answer lands; each text is asked once.
+ */
+async function brief($: Dollar, text: string | undefined): Promise<void> {
+  if (!text) return
+  const key = briefKey(text)
+  if (!key || key.split(' ').length <= 5 || briefing.has(key) || (await read($, briefsA))[key]) return
+  briefing.add(key)
+  try {
+    const r = await $.model.complete({
+      model: 'haiku',
+      effort: 'low',
+      maxTokens: 30,
+      system: 'You write git commit subjects.',
+      prompt: `Rewrite this as a commit-message subject: imperative mood, at most 6 words, no period, no quotes. Reply with the subject only.\n\n${key}`,
+    })
+    const subject = r.isAnswered ? subjectOf(r.text) : ''
+    if (subject) {
+      await update($, briefsA, all => {
+        const next = { ...all, [key]: subject }
+        const keys = Object.keys(next)
+        for (const k of keys.slice(0, Math.max(0, keys.length - 200))) delete next[k] // keep the newest 200
+        return next
+      })
+    }
+  } finally {
+    briefing.delete(key)
+  }
 }
 
 /** After a tool ran: keep the todo list from the Task tools, and note a shell started in the background. */
@@ -202,7 +216,6 @@ async function learnFromResult(
   if (!r || out.isError) return // a refusal or an error changed nothing
   const setTodos = async (change: (todos: Todo[]) => Todo[]): Promise<void> => {
     await touch($, id, row => ({ ...row, todos: change(row.todos) }))
-    await syncPlan($)
   }
   if (tool === 'TaskCreate') {
     const task = r.task as { id?: unknown; subject?: unknown } | undefined
@@ -257,21 +270,20 @@ export const register: Register = (on, options) => {
   const prices = parsePrices(options.prices)
   const toolRows = toolRowModeOf(options.toolRows)
   const forcedTtl = ttlOptionOf(options.cacheTtl)
-  const planFile = typeof options.planFile === 'string' && options.planFile ? options.planFile : 'docs/PROGRESS.md'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'work', description: 'Show or hide the work monitor above the prompt' })
     await touch($, MAIN, row => row)
-    await refresh($, planFile)
-    $.clock.every(TICK_MS, () => void refresh($, planFile))
-    $.clock.every(FAST_MS, () => void tick($))
+    await refresh($)
+    $.clock.every(TICK_MS, () => background(refresh($)))
+    $.clock.every(FAST_MS, () => background(tick($)))
     return next(e)
   })
 
   on('command.run', { command: 'work' }, async ($, e) => {
     if (e.args.trim() === 'debug') return { text: await debugReport($) }
     const isHidden = await update($, hiddenA, h => !h)
-    await refresh($, planFile)
+    await refresh($)
     return { text: isHidden ? 'Work monitor hidden.' : 'Work monitor shown.' }
   })
 
@@ -279,6 +291,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     try {
       await update($, seenA, seen => ({ ...seen, spawns: seen.spawns + 1 }))
+      background(brief($, e.description))
       if (result.agentId) {
         const id = result.agentId
         const now = await $.clock.now()
@@ -338,6 +351,7 @@ export const register: Register = (on, options) => {
     const result = r.value
     try {
       const said = sayingOf(result.answer)
+      background(brief($, said))
       const first = result.toolUses[0]
       const u = result.usage
       if (u && !e.agentId) {
@@ -384,6 +398,7 @@ export const register: Register = (on, options) => {
       const task = e.origin.kind === 'composer' ? taskOf(e.text) : ''
       if (task) {
         await touch($, MAIN, (row, now) => ({ ...row, task: clip(task, 200), said: undefined, doing: 'thinking', activityAt: now }))
+        background(brief($, task))
       }
     } catch {
       /* a monitor never fails a prompt */
@@ -394,7 +409,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const now = await $.clock.now()
     await touch($, e.agentId ?? MAIN, row => ({ ...row, status: 'idle', endedAt: now, doing: undefined, activityAt: now }))
-    void refresh($, planFile)
+    background(refresh($))
     return next(e)
   })
 
@@ -415,7 +430,6 @@ export const register: Register = (on, options) => {
         activityAt: now,
       }))
       await update($, seenA, seen => ({ ...seen, tools: { ...seen.tools, [e.tool]: (seen.tools[e.tool] ?? 0) + 1 } }))
-      if (todos) await syncPlan($)
     } catch {
       /* a monitor never fails a tool call */
     }
@@ -449,10 +463,10 @@ export const register: Register = (on, options) => {
     const agents = Object.values(await read($, agentsA))
     const quotas = await read($, quotasA)
     const ledgerUsd = await read($, usdA)
-    const checklist = await read($, checklistA)
-    const planClock = await read($, planClockA)
     const cache = await read($, cacheA)
     const expanded = await read($, expandedA)
+    const briefs = await read($, briefsA)
+    const short = (t: string): string => briefs[briefKey(t)] ?? shortOf(t)
     const bgAll = backgroundRows(await read($, backgroundA))
     const now = (await read($, nowA)) || 0
 
@@ -466,11 +480,6 @@ export const register: Register = (on, options) => {
     const total = agents.reduce((n, a) => addTokens(n, a.tokens), emptyTokens())
     const estUsd = agents.reduce((n, a) => n + costUsd(a.model, a.tokens, prices), 0)
 
-    const plan = planOf(checklist, agents.find(a => a.isMain))
-    const planFraction = todoFraction(plan)
-    const planDone = plan.filter(t => t.status === 'completed').length
-    const current = plan.find(t => t.status === 'in_progress') ?? plan.find(t => t.status === 'pending')
-    const eta = etaMs(planClock, planDone, plan.length, now)
     const running = agents.filter(a => a.status === 'running').length
 
     const state = bandState(agents, now)
@@ -479,14 +488,11 @@ export const register: Register = (on, options) => {
 
     const details = new Map(sorted.filter(a => expanded[a.id]).map(a => [a.id, detailOf(a, cols)] as const))
     const task = agents.find(a => a.isMain)?.task
-    // Cache and quota are boxes of their own when the band is tall enough, plain lines when it is short.
-    const boxed = e.props.maxRows >= BOXED_MIN_ROWS
+    // The Task box: a fixed window of TASK_ROWS lines over the task line and every agent's lines, scrolled by its
+    // own buttons, so the band never changes height however many agents run.
+    const boxed = true
     const bgShown = Math.min(bgAll.length, 3)
-    const shown = fitAgentRows(
-      e.props.maxRows,
-      sorted.map(a => 2 + (details.get(a.id)?.length ?? 0)),
-      bandFixedRows({ boxed, hasPlan: planFraction !== null, hasTask: Boolean(task), backgroundRows: bgShown ? bgShown + 1 : 0 }),
-    )
+    const taskScroll = await read($, taskScrollA)
     const barW = Math.min(12, Math.max(6, Math.floor(cols / 10)))
     const labelW = Math.max(12, Math.min(28, Math.floor(cols / 4)))
 
@@ -551,57 +557,69 @@ export const register: Register = (on, options) => {
           cacheContent
         )}
 
-        {task && (
-          <Text wrap="truncate-end">
-            <Text bold color={ORANGE}>Task </Text>
-            <Text color={C.text}>{clip(task, cols - 6)}</Text>
-          </Text>
-        )}
-
-        {sorted.length === 0 && <Text color={C.dim}>Nothing running yet.</Text>}
-        {sorted.slice(0, shown).map(a => {
-          const p = progressOf(a, finished)
-          const open = details.has(a.id)
-          const glyph = a.status === 'done' ? '✓' : a.status === 'failed' ? '✗' : a.status === 'idle' ? '◦' : spin
-          const color = a.status === 'failed' ? C.bad : a.status === 'done' ? C.done : a.status === 'idle' ? C.text : C.run
-          const elapsed = fmtDuration((a.endedAt ?? now) - a.startedAt)
-          const pct = `${(p.fraction * 100).toFixed(0)}%${p.isEstimate ? '~' : ''}`.padStart(5)
-          const head = `${open ? '▾' : '▸'}${glyph} ${clip(a.label, labelW).padEnd(labelW)} `
-          const meta = isAwaitingFirstReading(a)
-            ? a.isMain
-              ? ` waiting for first response… ${elapsed}`
-              : ` ${clip(a.type, 18)} · ${elapsed}`
-            : ` ${clip(`${a.model}·${a.effort}`, 18).padEnd(18)} ${fmtTokens(totalTokens(a.tokens)).padStart(6)} ~${fmtUsd(costUsd(a.model, a.tokens, prices))} ${elapsed}`
-          const quiet = quietOf(now, a.activityAt, a.status)
-          const lineColor = a.status === 'failed' ? C.bad : a.status === 'running' ? C.text : C.dim
-          return (
-            <Box key={`agent-${a.id}`} flexDirection="column">
-              <Button
-                key={`row-${a.id}`}
-                label={a.label}
-                plain
-                onPress={() => void update($, expandedA, m => ({ ...m, [a.id]: !m[a.id] }))}
-              >
+        {(() => {
+          const lines: RenderChildren[] = []
+          if (task)
+            lines.push(
+              <Text key="task" wrap="truncate-end">
+                <Text bold color={ORANGE}>Task </Text>
+                <Text color={C.text}>{clip(short(task), cols - 10)}</Text>
+              </Text>,
+            )
+          if (sorted.length === 0) lines.push(<Text key="none" color={C.dim}>Nothing running yet.</Text>)
+          for (const a of sorted) {
+            const p = progressOf(a, finished)
+            const open = Boolean(expanded[a.id])
+            const glyph = a.status === 'done' ? '✓' : a.status === 'failed' ? '✗' : a.status === 'idle' ? '◦' : spin
+            const color = a.status === 'failed' ? C.bad : a.status === 'done' ? C.done : a.status === 'idle' ? C.text : C.run
+            const elapsed = fmtDuration((a.endedAt ?? now) - a.startedAt)
+            const pct = `${(p.fraction * 100).toFixed(0)}%${p.isEstimate ? '~' : ''}`.padStart(5)
+            const quiet = quietOf(now, a.activityAt, a.status)
+            const lineColor = a.status === 'failed' ? C.bad : a.status === 'running' ? C.text : C.dim
+            const head = `${open ? '▾' : '▸'}${glyph} ${clip(short(a.label), labelW).padEnd(labelW)} `
+            const meta = isAwaitingFirstReading(a)
+              ? a.isMain
+                ? ` waiting for first response… ${elapsed}`
+                : ` ${clip(a.type, 18)} · ${elapsed}`
+              : ` ${clip(`${modelName(a.model)}·${a.effort}`, 18).padEnd(18)} ${fmtTokens(totalTokens(a.tokens)).padStart(6)} ~${fmtUsd(costUsd(a.model, a.tokens, prices))} ${elapsed}`
+            lines.push(
+              <Button key={`row-${a.id}`} label={a.label} plain onPress={() => void update($, expandedA, m => ({ ...m, [a.id]: !m[a.id] }))}>
                 <Text color={color} bold={a.status === 'running'}>{head}</Text>
                 <Text color={color}>{smoothBar(p.fraction, barW)}</Text>
                 <Text color={C.text}>{pct}</Text>
                 <Text color={C.dim}>{meta}</Text>
-              </Button>
-              <Text wrap="truncate-end">
+              </Button>,
+              <Text key={`now-${a.id}`} wrap="truncate-end">
                 {'     '}
                 {quiet ? <Text color={quiet.tone === 'warn' ? C.warn : C.dim}>{quiet.text} · </Text> : ''}
-                <Text color={lineColor}>{nowOf(a)}</Text>
-              </Text>
-              {(details.get(a.id) ?? []).map(d => (
-                <Text color={d.color} wrap="truncate-end">
-                  {'    '}
-                  {d.text}
-                </Text>
-              ))}
+                <Text color={lineColor}>{nowOf(a, short)}</Text>
+              </Text>,
+            )
+            if (open)
+              for (const [i, d] of detailOf(a, cols - 4).entries())
+                lines.push(
+                  <Text key={`d-${a.id}-${i}`} color={d.color} wrap="truncate-end">
+                    {'    '}
+                    {d.text}
+                  </Text>,
+                )
+          }
+          const w = scrollWindow(lines.length, taskScroll, TASK_ROWS)
+          const visible = lines.slice(w.offset, w.offset + TASK_ROWS)
+          while (visible.length < TASK_ROWS) visible.push(<Text key={`pad-${visible.length}`}> </Text>)
+          const move = (by: number) => () => void update($, taskScrollA, o => scrollWindow(lines.length, o + by, TASK_ROWS).offset)
+          return (
+            <Box key="task-box" flexDirection="column" borderStyle="round" borderColor={BLUE} backgroundColor={NAVY} paddingX={1}>
+              {visible}
+              <Box key="task-scroll">
+                {w.canUp ? <Button key="task-up" label="scroll up" hotkey="k" plain onPress={move(-TASK_ROWS)}>▲ up</Button> : <Text color={C.dim}>▲ up</Text>}
+                <Text color={C.dim}> · </Text>
+                {w.canDown ? <Button key="task-down" label="scroll down" hotkey="j" plain onPress={move(TASK_ROWS)}>▼ down</Button> : <Text color={C.dim}>▼ down</Text>}
+                <Text color={C.dim}>{`  lines ${lines.length ? w.offset + 1 : 0}–${w.offset + visible.filter((_, i) => i < lines.length - w.offset).length} of ${lines.length}`}</Text>
+              </Box>
             </Box>
           )
-        })}
-        {sorted.length > shown && <Text color={C.dim}>  … {sorted.length - shown} more (press a row to fold it)</Text>}
+        })()}
 
         {bgShown > 0 && (
           <Box key="background" flexDirection="column">
@@ -615,15 +633,6 @@ export const register: Register = (on, options) => {
             ))}
             {bgAll.length > bgShown && <Text color={C.dim}>  … {bgAll.length - bgShown} more</Text>}
           </Box>
-        )}
-
-        {planFraction !== null && (
-          <Text color={C.text} wrap="truncate-end">
-            <Text bold color={ORANGE}>Plan </Text>
-            {planDone}/{plan.length} {smoothBar(planFraction, barW)} {(planFraction * 100).toFixed(0)}%
-            {eta !== null ? <Text color={C.dim}> · ~{fmtDuration(eta)} left</Text> : ''}
-            {current ? <Text color={current.status === 'in_progress' ? C.run : C.dim}>  ▶ {current.activeForm ?? current.content}</Text> : ''}
-          </Text>
         )}
 
         {boxed ? (

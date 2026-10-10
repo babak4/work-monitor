@@ -15,12 +15,6 @@
       ],
       "default": "hidden"
     },
-    "planFile": {
-      "type": "string",
-      "title": "Plan checklist file",
-      "description": "Markdown checklist (- [ ] / - [x]) read from the working directory to show what is left to do.",
-      "default": "docs/PROGRESS.md"
-    },
     "prices": {
       "type": "string",
       "title": "Price table (USD per million tokens)",

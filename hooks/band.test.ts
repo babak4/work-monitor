@@ -21,15 +21,6 @@ test('a tall band gives the cache and the quota a bordered box each', async $ =>
   await ui.unmount()
 })
 
-test('a short band keeps the cache and the quota as plain lines, with no boxes', async $ => {
-  const ui = await $.ui.mount(BAND(10))
-  expect(await ui.find({ key: 'cache-box' })).toBeUndefined()
-  expect(await ui.find({ key: 'quota-box' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /Cache/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Quota/ })).toBeDefined()
-  await ui.unmount()
-})
-
 test('a narrow band still draws, wording shortened to fit', async $ => {
   const ui = await $.ui.mount(BAND(20, 40))
   expect(await ui.find({ type: 'Text', text: /Work monitor/ })).toBeDefined()

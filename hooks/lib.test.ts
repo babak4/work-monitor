@@ -10,13 +10,11 @@ import {
   fmtDuration,
   fmtReset,
   fmtTokens,
-  parseChecklist,
   parsePrices,
   progressOf,
   shouldCompactToolRow,
   toolRowModeOf,
   isQuietGroup,
-  fitAgentRows,
   applyTaskCreate,
   applyTaskUpdate,
   applyTaskList,
@@ -24,8 +22,7 @@ import {
   noteBackground,
   syncBackground,
   backgroundRows,
-  bandFixedRows,
-  BOXED_MIN_ROWS,
+  scrollWindow,
   ttlOptionOf,
   contextTokensOf,
   inferTtl,
@@ -37,15 +34,16 @@ import {
   sayingOf,
   taskOf,
   nowOf,
+  modelName,
+  shortOf,
+  subjectOf,
+  briefKey,
   quietOf,
   isAwaitingFirstReading,
   smoothBar,
   heat,
   spinnerFrame,
   bandState,
-  planOf,
-  trackPlan,
-  etaMs,
   tierOf,
   todoFraction,
 } from './lib'
@@ -89,13 +87,6 @@ test('bar clamps and fills proportionally', () => {
   expect(bar(0.5, 10)).toBe('█████░░░░░')
   expect(bar(2, 4)).toBe('████')
   expect(bar(Number.NaN, 4)).toBe('░░░░')
-})
-
-test('checklist parsing reads done, in-progress and pending items', () => {
-  const todos = parseChecklist('# Plan\n- [x] one\n- [~] two\n- [ ] three\nnot a task\n* [X] four')
-  expect(todos.map(t => t.status)).toEqual(['completed', 'in_progress', 'pending', 'completed'])
-  expect(todoFraction(todos)).toBe(0.5)
-  expect(todoFraction([])).toBeNull()
 })
 
 test('progress uses own todos, else an estimate from finished agents, capped below 100%', () => {
@@ -149,24 +140,6 @@ test('isQuietGroup keeps groups holding a failure', () => {
   expect(isQuietGroup([{ isErrored: false, isInterrupted: true }])).toBe(false)
 })
 
-test('bandFixedRows counts the border, header, boxes or lines, plan and task', () => {
-  expect(bandFixedRows({ boxed: true, hasPlan: false, hasTask: false })).toBe(9)
-  expect(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true })).toBe(11)
-  expect(bandFixedRows({ boxed: false, hasPlan: false, hasTask: false })).toBe(5)
-  expect(bandFixedRows({ boxed: false, hasPlan: true, hasTask: true })).toBe(7)
-  expect(bandFixedRows({ boxed: true, hasPlan: false, hasTask: false, backgroundRows: 3 })).toBe(12)
-  expect(BOXED_MIN_ROWS).toBeGreaterThan(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true }) + 2)
-})
-
-test('fitAgentRows fits agents, expanded ones included, after the fixed rows', () => {
-  expect(fitAgentRows(20, [2, 2, 2], 5)).toBe(3)
-  expect(fitAgentRows(11, [2, 2, 2, 2, 2], 5)).toBe(3)
-  expect(fitAgentRows(11, [2, 5, 2], 5)).toBe(1)
-  expect(fitAgentRows(4, [3, 2], 5)).toBe(1)
-  expect(fitAgentRows(10, [], 5)).toBe(0)
-  expect(fitAgentRows(14, [2, 2, 2], 11)).toBe(1)
-})
-
 test('smoothBar is always the requested width and fills in eighths', () => {
   expect(smoothBar(0, 4)).toBe('░░░░')
   expect(smoothBar(1, 4)).toBe('████')
@@ -197,27 +170,6 @@ test('bandState: working beats failed beats done beats idle', () => {
   expect(bandState([{ status: 'idle', endedAt: 1000 }], 5000)).toBe('done')
   expect(bandState([{ status: 'idle', endedAt: 1000 }], 20_000)).toBe('idle')
   expect(bandState([], 5000)).toBe('idle')
-})
-
-test('planOf prefers the checklist file over the agent todos', () => {
-  const t = (content: string) => ({ content, status: 'pending' as const })
-  expect(planOf([t('a')], { todos: [t('b')] }).map(x => x.content)).toEqual(['a'])
-  expect(planOf([], { todos: [t('b')] }).map(x => x.content)).toEqual(['b'])
-  expect(planOf([], undefined)).toEqual([])
-})
-
-test('the plan clock restarts when the plan changes and gives an ETA from the pace', () => {
-  expect(trackPlan(null, 0, 0, 100)).toBe(null)
-  const c = trackPlan(null, 1, 5, 1000)
-  expect(c).toEqual({ startedAt: 1000, baseDone: 1, total: 5 })
-  expect(trackPlan(c, 2, 5, 2000)).toBe(c)
-  expect(trackPlan(c, 2, 6, 2000)).toEqual({ startedAt: 2000, baseDone: 2, total: 6 })
-  expect(trackPlan(c, 0, 5, 2000)).toEqual({ startedAt: 2000, baseDone: 0, total: 5 })
-  expect(etaMs(c, 1, 5, 5000)).toBe(null)
-  // 1 item in 4s since the clock started, 3 left: 12s
-  expect(etaMs(c, 2, 5, 5000)).toBe(12_000)
-  expect(etaMs(c, 5, 5, 9000)).toBe(null)
-  expect(etaMs(null, 2, 5, 9000)).toBe(null)
 })
 
 test('doingOf is a generic label: no commands, paths or counts', () => {
@@ -404,4 +356,44 @@ test('backgroundRows lists running first and leaves subagents to the agent rows'
     c: { id: 'c', kind: 'subagent', label: 'c', status: 'running' as const, startedAt: 3 },
   }
   expect(backgroundRows(all).map(x => x.id)).toEqual(['b', 'a'])
+})
+
+test('scrollWindow clamps the offset and says which way it can move', () => {
+  expect(scrollWindow(3, 0, 5)).toEqual({ offset: 0, canUp: false, canDown: false })
+  expect(scrollWindow(12, 0, 5)).toEqual({ offset: 0, canUp: false, canDown: true })
+  expect(scrollWindow(12, 5, 5)).toEqual({ offset: 5, canUp: true, canDown: true })
+  expect(scrollWindow(12, 99, 5)).toEqual({ offset: 7, canUp: true, canDown: false })
+  expect(scrollWindow(12, -3, 5)).toEqual({ offset: 0, canUp: false, canDown: true })
+})
+
+test('shortOf makes a commit-subject-sized line locally', () => {
+  expect(shortOf("Now I'll update the tests for the new band layout and then run the whole suite.")).toBe('Update the tests for the new band…')
+  expect(shortOf('Let me check the merge order. Then more.')).toBe('Check the merge order')
+  expect(shortOf('start wave 2 and spin up subagents when possible')).toBe('Start wave 2 and spin up subagents…')
+  expect(shortOf('Fix login')).toBe('Fix login')
+  expect(shortOf('')).toBe('')
+})
+
+test('subjectOf cleans the model reply into one short subject', () => {
+  expect(subjectOf('"Merge wave 2 branches."\nextra')).toBe('Merge wave 2 branches')
+  expect(subjectOf('Subject: Run Playwright suite')).toBe('Run Playwright suite')
+  expect(subjectOf('x'.repeat(90)).length).toBe(60)
+  expect(briefKey('  a   b ')).toBe('a b')
+})
+
+test('nowOf shortens the sentence it shows', () => {
+  expect(nowOf(agentRow({ doing: 'editing files', said: 'Now I will update every test file in the repository today.' }), shortOf)).toBe(
+    'editing files · Update every test file in the repository…',
+  )
+})
+
+test('modelName shows Claude models as Family+version', () => {
+  expect(modelName('claude-opus-5-5')).toBe('Opus5.5')
+  expect(modelName('claude-sonnet-5-5')).toBe('Sonnet5.5')
+  expect(modelName('claude-haiku-5-5')).toBe('Haiku5.5')
+  expect(modelName('claude-fable-5-1')).toBe('Fable5.1')
+  expect(modelName('claude-opus-4-1-20250805')).toBe('Opus4.1')
+  expect(modelName('claude-opus-4-20250514')).toBe('Opus4')
+  expect(modelName('claude-3-5-sonnet-20241022')).toBe('Sonnet3.5')
+  expect(modelName('?')).toBe('?')
 })
