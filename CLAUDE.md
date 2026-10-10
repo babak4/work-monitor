@@ -18,8 +18,9 @@ tsc -p .                      # type-check; needs .claude-plugin/types/, absent 
 ```
 
 A change is done when `validate` and `test` pass **and** you have looked at the band in a live session: the tests
-cover `hooks/lib.ts` plus a smoke mount of the band (`band.test.ts`: a test's `$` has no `$.state`, so it cannot seed
-data), never how real data looks. The type-check has 2 known errors, both `noUncheckedIndexedAccess` in `lib.ts`
+cover `hooks/lib.ts`, a smoke mount of the band (`band.test.ts`) and event replays (`tasks.test.ts`: a test's `$` has no
+`$.state`, so it raises `tool.call` / `classic.Stop` beneath the plugin and reads the result off the mounted band), never how
+real data looks. When a test should prove a fix, break the fix and watch it fail. The type-check has 2 known errors, both `noUncheckedIndexedAccess` in `lib.ts`
 (`parseChecklist`, `progressOf`); new code should add none.
 
 The mod is also installed at user scope from this folder (marketplace `work-monitor-local`), so **every** Claude Code
@@ -31,14 +32,21 @@ Two code files, one data flow. `hooks/register.tsx` is the only module the engin
 only tested part, so new logic goes there and `register.tsx` stays wiring and JSX.
 
 - **State.** Everything the band shows lives in `$.state` atoms (`agents`, `quotas`, `sessionUsd`, `checklist`, `now`,
-  `isHidden`, `expanded`, `planClock`, `cache`), each declared under `work-monitor` in `types/index.d.ts` (validate fails
+  `isHidden`, `expanded`, `planClock`, `cache`, `background`, `seen`), each declared under `work-monitor` in `types/index.d.ts` (validate fails
   otherwise). `agents` is a map of `AgentRow`s keyed by id: `'main'` for the main session, `e.agentId` for subagents.
   `touch($, id, patch)` is the one way to change a row. A write redraws every `ui.render` hook that read the atom.
 - **Writers.** Event hooks feed the rows: `turn.step` (model, effort, tokens, live `doing` label, last `said` line),
-  `tool.call` (`doing`, todos from TodoWrite), `prompt.submit` (the main row's `task`), `turn.complete` (back to idle),
+  `tool.call` (`doing`, and, once the call has run, todos and background shells from its result), `prompt.submit` (the main row's `task`), `turn.complete` (back to idle),
   `agent.spawn` (label, type). Two timers start in `session.start`: a 5 s `refresh` (quota and ledger via
   `$.session.usage()`, subagent status via `$.agent.list()`, the checklist file, the plan clock) and a 500 ms `tick`
   that only advances `now` while something runs, which drives the spinner, elapsed times and the quiet-for marker.
+- **Todos and background work.** This build has two todo systems and a session may use either: `TodoWrite` sends the
+  whole list; `TaskCreate` / `TaskUpdate` / `TaskList` change one task per call and the id only comes back in the
+  result, so `learnFromResult` (after `await next(e)`) rebuilds the list with `applyTask*`. Background shells are noted
+  from a Bash result's `backgroundTaskId` and reconciled by `classic.Stop`, whose `background_tasks` is the engine's own
+  list (subagents are shown as agents, not here). `refresh` also adds a row for any agent in `$.agent.list()` that no
+  event told us about. Never show a background command line, only its description. `/work debug` prints what the mod
+  has seen (agents, tool names by count, background tasks): ask for it first when a session "shows nothing".
 - **`turn.step` is a stream.** The hook iterates `next(e)` by hand instead of `yield*` so it can see chunks and still
   get the final result (answer text, usage). It writes state only when the label changes (and every 25 chunks), never
   per token, and wraps each write in try/catch so a monitor failure cannot break the stream.

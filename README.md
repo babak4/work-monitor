@@ -1,6 +1,6 @@
 # work-monitor
 
-A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work monitor above the prompt**: a navy band with an orange border (`/work` shows or hides it). It shows, live:
+A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work monitor above the prompt**: a navy band with an orange border (`/work` shows or hides it; `/work debug` prints what the mod has seen, for when something looks missing). It shows, live:
 
 - every agent (the main session and each subagent) with its status, model, effort, tokens and a progress bar
   (`~` marks an estimate when the agent gave no explicit todo list). **Press a row to expand it** (its activity, token
@@ -19,8 +19,10 @@ A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work 
   200.0k tok`. The cache lifetime (5 minutes or 1 hour) is not exposed to plugins, so with the default `cacheTtl` of
   `auto` the mod assumes 5m and marks the countdown `~` until it sees a cache survive more than five minutes; set
   `5m` or `1h` to be exact;
+- what is **running in the background** (shells, monitors, workflows) in a `Background` block, by description, never the
+  command; subagents, including background ones, are rows like any other agent;
 - a **plan line** (done/total, a bar, the current item and a `~` time-left estimate from the pace so far) read from the
-  agent's todo list or a markdown checklist in the current project (`- [ ]` / `- [x]`);
+  agent's todo list (`TodoWrite`, or `TaskCreate` / `TaskUpdate`) or a markdown checklist in the current project (`- [ ]` / `- [x]`);
 - the remaining rate-limit **quota** for the current windows, in a box of its own at the bottom, coloured red-amber-green
   by how much is left (both boxes become plain one-line rows when the terminal is short);
 - by default, **no tool rows** in the main transcript: ordinary tool calls and their output are hidden, so the
