@@ -1,6 +1,6 @@
 # work-monitor
 
-A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work monitor above the prompt**: a navy band with an orange border (`/work` shows or hides it). It shows, live:
+A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work monitor above the prompt**: a navy band with an orange border (`/work` shows or hides it; `/work debug` prints what the mod has seen, for when something looks missing). It shows, live:
 
 - every agent (the main session and each subagent) with its status, model, effort, tokens and a progress bar
   (`~` marks an estimate when the agent gave no explicit todo list). **Press a row to expand it** (its activity, token
@@ -19,10 +19,15 @@ A [Claude Code](https://claude.com/claude-code) mod (plugin) that adds a **work 
   200.0k tok`. The cache lifetime (5 minutes or 1 hour) is not exposed to plugins, so with the default `cacheTtl` of
   `auto` the mod assumes 5m and marks the countdown `~` until it sees a cache survive more than five minutes; set
   `5m` or `1h` to be exact;
-- a **plan line** (done/total, a bar, the current item and a `~` time-left estimate from the pace so far) read from the
-  agent's todo list or a markdown checklist in the current project (`- [ ]` / `- [x]`);
+- what is **running in the background** (shells, monitors, workflows) in a `Background` block, by description, never the
+  command; subagents, including background ones, are rows like any other agent;
 - the remaining rate-limit **quota** for the current windows, in a box of its own at the bottom, coloured red-amber-green
-  by how much is left (both boxes become plain one-line rows when the terminal is short);
+  by how much is left ;
+- the engine's **mode line** (`auto mode on (shift+tab to cycle) · …`) in the middle of the header, moved up from under
+  the prompt (the engine's own line returns whenever the band is not showing);
+- the **Task box** (blue border): the current task and every agent, each as a short commit-style subject (a small
+  model, Haiku, rewrites long prompts and sentences; a local shortener shows until it answers), five lines at a time; ▲ up / ▼ down (or k / j
+  with the band focused) scroll it, so the band keeps a fixed height;
 - by default, **no tool rows** in the main transcript: ordinary tool calls and their output are hidden, so the
   transcript holds your prompts and Claude's replies (`toolRows`: `hidden`, `compact` or `full`). Errors,
   interruptions and permission prompts always show.
@@ -52,7 +57,6 @@ Sessions that are already running need `/reload-plugins` or a restart once.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `planFile` | `docs/PROGRESS.md` | Checklist read from the **current working directory** for the plan line. Projects without the file fall back to the agent's own todo list. |
 | `toolRows` | `hidden` | Ordinary tool calls in the transcript: `hidden`, `compact` (one dim line each) or `full`. |
 | `cacheTtl` | `auto` | Prompt-cache lifetime: `auto` (learned from behaviour, 5m assumed until then), `5m` or `1h`. |
 | `prices` | built-in | JSON price table, USD per million tokens, e.g. `{"opus":{"in":5,"out":25}}`. Cache read defaults to 0.1x input and cache write to 1.25x unless `cr`/`cw` are given. |
@@ -78,6 +82,6 @@ See `CLAUDE.md` for the layout and the rules for changing it.
 | `.claude-plugin/marketplace.json` | lets this folder be added as a local marketplace |
 | `hooks/hooks.json` | points at the hooks module |
 | `hooks/register.tsx` | the mod: event handlers, state, band rendering |
-| `hooks/lib.ts` | pure helpers (pricing, progress, checklist parsing, formatting) |
+| `hooks/lib.ts` | pure helpers (pricing, progress, formatting) |
 | `hooks/lib.test.ts` | unit tests for `lib.ts` |
 | `types/index.d.ts` | the `$.state` contract (`work-monitor` key) and shared types |

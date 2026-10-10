@@ -10,15 +10,19 @@ import {
   fmtDuration,
   fmtReset,
   fmtTokens,
-  parseChecklist,
   parsePrices,
   progressOf,
   shouldCompactToolRow,
   toolRowModeOf,
   isQuietGroup,
-  fitAgentRows,
-  bandFixedRows,
-  BOXED_MIN_ROWS,
+  applyTaskCreate,
+  applyTaskUpdate,
+  applyTaskList,
+  bgLabelOf,
+  noteBackground,
+  syncBackground,
+  backgroundRows,
+  scrollWindow,
   ttlOptionOf,
   contextTokensOf,
   inferTtl,
@@ -30,15 +34,17 @@ import {
   sayingOf,
   taskOf,
   nowOf,
+  modelName,
+  hintLine,
+  shortOf,
+  subjectOf,
+  briefKey,
   quietOf,
   isAwaitingFirstReading,
   smoothBar,
   heat,
   spinnerFrame,
   bandState,
-  planOf,
-  trackPlan,
-  etaMs,
   tierOf,
   todoFraction,
 } from './lib'
@@ -82,13 +88,6 @@ test('bar clamps and fills proportionally', () => {
   expect(bar(0.5, 10)).toBe('█████░░░░░')
   expect(bar(2, 4)).toBe('████')
   expect(bar(Number.NaN, 4)).toBe('░░░░')
-})
-
-test('checklist parsing reads done, in-progress and pending items', () => {
-  const todos = parseChecklist('# Plan\n- [x] one\n- [~] two\n- [ ] three\nnot a task\n* [X] four')
-  expect(todos.map(t => t.status)).toEqual(['completed', 'in_progress', 'pending', 'completed'])
-  expect(todoFraction(todos)).toBe(0.5)
-  expect(todoFraction([])).toBeNull()
 })
 
 test('progress uses own todos, else an estimate from finished agents, capped below 100%', () => {
@@ -142,23 +141,6 @@ test('isQuietGroup keeps groups holding a failure', () => {
   expect(isQuietGroup([{ isErrored: false, isInterrupted: true }])).toBe(false)
 })
 
-test('bandFixedRows counts the border, header, boxes or lines, plan and task', () => {
-  expect(bandFixedRows({ boxed: true, hasPlan: false, hasTask: false })).toBe(9)
-  expect(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true })).toBe(11)
-  expect(bandFixedRows({ boxed: false, hasPlan: false, hasTask: false })).toBe(5)
-  expect(bandFixedRows({ boxed: false, hasPlan: true, hasTask: true })).toBe(7)
-  expect(BOXED_MIN_ROWS).toBeGreaterThan(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true }) + 2)
-})
-
-test('fitAgentRows fits agents, expanded ones included, after the fixed rows', () => {
-  expect(fitAgentRows(20, [2, 2, 2], 5)).toBe(3)
-  expect(fitAgentRows(11, [2, 2, 2, 2, 2], 5)).toBe(3)
-  expect(fitAgentRows(11, [2, 5, 2], 5)).toBe(1)
-  expect(fitAgentRows(4, [3, 2], 5)).toBe(1)
-  expect(fitAgentRows(10, [], 5)).toBe(0)
-  expect(fitAgentRows(14, [2, 2, 2], 11)).toBe(1)
-})
-
 test('smoothBar is always the requested width and fills in eighths', () => {
   expect(smoothBar(0, 4)).toBe('░░░░')
   expect(smoothBar(1, 4)).toBe('████')
@@ -189,27 +171,6 @@ test('bandState: working beats failed beats done beats idle', () => {
   expect(bandState([{ status: 'idle', endedAt: 1000 }], 5000)).toBe('done')
   expect(bandState([{ status: 'idle', endedAt: 1000 }], 20_000)).toBe('idle')
   expect(bandState([], 5000)).toBe('idle')
-})
-
-test('planOf prefers the checklist file over the agent todos', () => {
-  const t = (content: string) => ({ content, status: 'pending' as const })
-  expect(planOf([t('a')], { todos: [t('b')] }).map(x => x.content)).toEqual(['a'])
-  expect(planOf([], { todos: [t('b')] }).map(x => x.content)).toEqual(['b'])
-  expect(planOf([], undefined)).toEqual([])
-})
-
-test('the plan clock restarts when the plan changes and gives an ETA from the pace', () => {
-  expect(trackPlan(null, 0, 0, 100)).toBe(null)
-  const c = trackPlan(null, 1, 5, 1000)
-  expect(c).toEqual({ startedAt: 1000, baseDone: 1, total: 5 })
-  expect(trackPlan(c, 2, 5, 2000)).toBe(c)
-  expect(trackPlan(c, 2, 6, 2000)).toEqual({ startedAt: 2000, baseDone: 2, total: 6 })
-  expect(trackPlan(c, 0, 5, 2000)).toEqual({ startedAt: 2000, baseDone: 0, total: 5 })
-  expect(etaMs(c, 1, 5, 5000)).toBe(null)
-  // 1 item in 4s since the clock started, 3 left: 12s
-  expect(etaMs(c, 2, 5, 5000)).toBe(12_000)
-  expect(etaMs(c, 5, 5, 9000)).toBe(null)
-  expect(etaMs(null, 2, 5, 9000)).toBe(null)
 })
 
 test('doingOf is a generic label: no commands, paths or counts', () => {
@@ -328,4 +289,122 @@ test('cacheText picks the fullest wording that fits, after the Cache label', () 
   expect(cacheText(gone, 30)).toBe('expired · ~$1.15 extra')
   expect(cacheText(cacheStatus({ lastAt: 0.5, tokens: 1, model: 'x', ttl: null }, null, 0.5 + 400_000), 200)).toContain('TTL unknown')
   expect(cacheText({ kind: 'none' }, 10)).toBe('no reading yet')
+})
+
+test('TaskCreate then TaskUpdate rebuild the todo list, one task per call', () => {
+  let t = applyTaskCreate([], { id: '1', subject: 'Write tests' }, { activeForm: 'Writing tests' })
+  t = applyTaskCreate(t, { id: '2', subject: 'Ship it' }, {})
+  expect(t).toEqual([
+    { id: '1', content: 'Write tests', status: 'pending', activeForm: 'Writing tests' },
+    { id: '2', content: 'Ship it', status: 'pending' },
+  ])
+  expect(applyTaskCreate(t, { id: '1', subject: 'again' }, {})).toEqual(t)
+  t = applyTaskUpdate(t, { taskId: '1', status: 'in_progress' })
+  expect(t[0]?.status).toBe('in_progress')
+  expect(t[0]?.activeForm).toBe('Writing tests')
+  t = applyTaskUpdate(t, { taskId: '2', subject: 'Ship it today', activeForm: 'Shipping', status: 'completed' })
+  expect(t[1]).toEqual({ id: '2', content: 'Ship it today', status: 'completed', activeForm: 'Shipping' })
+  expect(applyTaskUpdate(t, { taskId: '9', status: 'completed' })).toEqual(t)
+  expect(applyTaskUpdate(t, { taskId: '1', status: 'bogus' })[0]?.status).toBe('in_progress')
+  expect(applyTaskUpdate(t, { taskId: '1', status: 'deleted' }).map(x => x.id)).toEqual(['2'])
+})
+
+test('a TaskList result replaces the list and keeps the activeForm already known', () => {
+  const known = [{ id: '1', content: 'a', status: 'pending' as const, activeForm: 'Doing a' }]
+  const out = applyTaskList(known, [
+    { id: '1', subject: 'a', status: 'completed' },
+    { id: '2', subject: 'b', status: 'in_progress' },
+    { id: '3', subject: 'c' },
+  ])
+  expect(out).toEqual([
+    { id: '1', content: 'a', status: 'completed', activeForm: 'Doing a' },
+    { id: '2', content: 'b', status: 'in_progress' },
+    { id: '3', content: 'c', status: 'pending' },
+  ])
+  expect(applyTaskList(out, [])).toEqual([])
+})
+
+test('background labels use the description, never a command', () => {
+  expect(bgLabelOf('Run the test suite\nnpm test --watch', 'shell')).toBe('Run the test suite')
+  expect(bgLabelOf('', 'monitor')).toBe('monitor')
+  expect(bgLabelOf('x'.repeat(100), 'shell').length).toBe(60)
+})
+
+test('background tasks are noted at start, reconciled by the engine snapshot, and expire once finished', () => {
+  const started = noteBackground({}, { id: 'b1', kind: 'shell', label: 'Run tests' }, 1_000)
+  expect(started.b1).toEqual({ id: 'b1', kind: 'shell', label: 'Run tests', status: 'running', startedAt: 1_000 })
+  expect(noteBackground(started, { id: 'b1', kind: 'shell', label: 'other' }, 9_000).b1?.startedAt).toBe(1_000)
+
+  const snap = [
+    { id: 'b1', type: 'shell', status: 'running', description: 'Run tests' },
+    { id: 'm1', type: 'monitor', status: 'running', description: 'Watch the log' },
+    { id: 'z', type: 'shell', status: 'completed', description: 'old' },
+  ]
+  const synced = syncBackground(started, snap, 5_000)
+  expect(Object.keys(synced).sort()).toEqual(['b1', 'm1'])
+  expect(synced.b1?.startedAt).toBe(1_000)
+  expect(synced.m1?.startedAt).toBe(5_000)
+
+  const later = syncBackground(synced, [{ id: 'm1', type: 'monitor', status: 'running', description: 'Watch the log' }], 8_000)
+  expect(later.b1).toMatchObject({ status: 'done', endedAt: 8_000 })
+  expect(syncBackground(later, [], 8_000 + 70_000).b1).toBeUndefined()
+})
+
+test('backgroundRows lists running first and leaves subagents to the agent rows', () => {
+  const all = {
+    a: { id: 'a', kind: 'shell', label: 'a', status: 'done' as const, startedAt: 1 },
+    b: { id: 'b', kind: 'monitor', label: 'b', status: 'running' as const, startedAt: 2 },
+    c: { id: 'c', kind: 'subagent', label: 'c', status: 'running' as const, startedAt: 3 },
+  }
+  expect(backgroundRows(all).map(x => x.id)).toEqual(['b', 'a'])
+})
+
+test('scrollWindow clamps the offset and says which way it can move', () => {
+  expect(scrollWindow(3, 0, 5)).toEqual({ offset: 0, canUp: false, canDown: false })
+  expect(scrollWindow(12, 0, 5)).toEqual({ offset: 0, canUp: false, canDown: true })
+  expect(scrollWindow(12, 5, 5)).toEqual({ offset: 5, canUp: true, canDown: true })
+  expect(scrollWindow(12, 99, 5)).toEqual({ offset: 7, canUp: true, canDown: false })
+  expect(scrollWindow(12, -3, 5)).toEqual({ offset: 0, canUp: false, canDown: true })
+})
+
+test('shortOf makes a commit-subject-sized line locally', () => {
+  expect(shortOf("Now I'll update the tests for the new band layout and then run the whole suite.")).toBe('Update the tests for the new band…')
+  expect(shortOf('Let me check the merge order. Then more.')).toBe('Check the merge order')
+  expect(shortOf('start wave 2 and spin up subagents when possible')).toBe('Start wave 2 and spin up subagents…')
+  expect(shortOf('Fix login')).toBe('Fix login')
+  expect(shortOf('')).toBe('')
+})
+
+test('subjectOf cleans the model reply into one short subject', () => {
+  expect(subjectOf('"Merge wave 2 branches."\nextra')).toBe('Merge wave 2 branches')
+  expect(subjectOf('Subject: Run Playwright suite')).toBe('Run Playwright suite')
+  expect(subjectOf('x'.repeat(90)).length).toBe(60)
+  expect(briefKey('  a   b ')).toBe('a b')
+})
+
+test('nowOf shortens the sentence it shows', () => {
+  expect(nowOf(agentRow({ doing: 'editing files', said: 'Now I will update every test file in the repository today.' }), shortOf)).toBe(
+    'editing files · Update every test file in the repository…',
+  )
+})
+
+test('modelName shows Claude models as Family+version', () => {
+  expect(modelName('claude-opus-5-5')).toBe('Opus5.5')
+  expect(modelName('claude-sonnet-5-5')).toBe('Sonnet5.5')
+  expect(modelName('claude-haiku-5-5')).toBe('Haiku5.5')
+  expect(modelName('claude-fable-5-1')).toBe('Fable5.1')
+  expect(modelName('claude-opus-4-1-20250805')).toBe('Opus4.1')
+  expect(modelName('claude-opus-4-20250514')).toBe('Opus4')
+  expect(modelName('claude-3-5-sonnet-20241022')).toBe('Sonnet3.5')
+  expect(modelName('?')).toBe('?')
+})
+
+test('hintLine fits the engine hint into the room, dropping trailing parts first', () => {
+  const h = '▸▸ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage'
+  expect(hintLine(h, 100)).toBe(h)
+  expect(hintLine(h, 51)).toBe('▸▸ auto mode on (shift+tab to cycle) · ← for agents')
+  expect(hintLine(h, 40)).toBe('▸▸ auto mode on (shift+tab to cycle)')
+  expect(hintLine(h, 12)).toBe('▸▸ auto mod…')
+  expect(hintLine('  esc   to interrupt ', 40)).toBe('esc to interrupt')
+  expect(hintLine('', 10)).toBe('')
 })

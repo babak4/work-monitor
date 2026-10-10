@@ -1,4 +1,4 @@
-import type { AgentRow, AgentStatus, CacheState, PlanClock, Todo, Tokens } from '../types'
+import type { AgentRow, AgentStatus, BgTask, CacheState, Todo, Tokens } from '../types'
 
 export type Price = { in: number; out: number; cr?: number; cw?: number }
 export type PriceTable = Record<string, Price>
@@ -65,21 +65,6 @@ export function bar(fraction: number, width = 12): string {
   return '█'.repeat(full) + '░'.repeat(width - full)
 }
 
-/** `- [ ] text` / `- [x] text` lines; a leading `*` bullet works too. */
-export function parseChecklist(markdown: string): Todo[] {
-  const out: Todo[] = []
-  for (const line of markdown.split('\n')) {
-    const m = /^\s*[-*]\s+\[([ xX~])\]\s+(.+?)\s*$/.exec(line)
-    if (!m) continue
-    const mark = m[1]
-    out.push({
-      content: m[2],
-      status: mark === ' ' ? 'pending' : mark === '~' ? 'in_progress' : 'completed',
-    })
-  }
-  return out
-}
-
 export const todoFraction = (todos: readonly Todo[]): number | null =>
   todos.length === 0 ? null : todos.filter(t => t.status === 'completed').length / todos.length
 
@@ -133,31 +118,6 @@ export const toolRowModeOf = (raw: unknown): ToolRowMode =>
 export const isQuietGroup = (calls: ReadonlyArray<{ isErrored: boolean; isInterrupted: boolean }>): boolean =>
   calls.every(c => !c.isErrored && !c.isInterrupted)
 
-/** Below this many rows the cache and quota drop their boxes and take one plain line each. */
-export const BOXED_MIN_ROWS = 14
-
-/**
- * Rows the band spends before any agent: the border (2), the header (1), the cache and quota (a
- * 3-row box each, or 1 plain line each when short), and the plan and Task lines when present.
- */
-export const bandFixedRows = (o: { boxed: boolean; hasPlan: boolean; hasTask: boolean }): number =>
-  2 + 1 + (o.boxed ? 6 : 2) + (o.hasPlan ? 1 : 0) + (o.hasTask ? 1 : 0)
-
-/**
- * How many agents fit in `maxRows` once `fixedRows` are spent. `costs` is the height of each agent in
- * order (its row, its now-line, plus detail lines when expanded); at least one agent always shows.
- */
-export function fitAgentRows(maxRows: number, costs: readonly number[], fixedRows: number): number {
-  let room = maxRows - fixedRows
-  let n = 0
-  for (const c of costs) {
-    if (n > 0 && c > room) break
-    room -= c
-    n += 1
-  }
-  return Math.min(costs.length, Math.max(n, costs.length > 0 ? 1 : 0))
-}
-
 const PARTIAL = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉'] as const
 
 /** A progress bar in eighths of a cell, always exactly `width` cells wide. */
@@ -206,23 +166,6 @@ export function bandState(
   if (agents.some(a => a.status === 'failed' && now - (a.endedAt ?? now) < failedMs)) return 'failed'
   const lastEnd = agents.reduce((m, a) => Math.max(m, a.endedAt ?? 0), 0)
   return lastEnd > 0 && now - lastEnd < doneMs ? 'done' : 'idle'
-}
-
-/** The plan to show: the project checklist when it has items, else the main agent's todo list. */
-export const planOf = (checklist: readonly Todo[], main: { todos: Todo[] } | undefined): Todo[] =>
-  checklist.length > 0 ? [...checklist] : (main?.todos ?? [])
-
-/** Where the pace of the current plan is measured from; starts over when the plan changes shape. */
-export function trackPlan(prev: PlanClock | null, done: number, total: number, now: number): PlanClock | null {
-  if (total === 0) return null
-  if (!prev || prev.total !== total || done < prev.baseDone) return { startedAt: now, baseDone: done, total }
-  return prev
-}
-
-/** Estimated milliseconds to finish the plan at the pace so far, or null before one item is done. */
-export function etaMs(clock: PlanClock | null, done: number, total: number, now: number): number | null {
-  if (!clock || done >= total || done <= clock.baseDone) return null
-  return ((now - clock.startedAt) / (done - clock.baseDone)) * (total - done)
 }
 
 const clipText = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0, Math.max(1, n - 1))}…`)
@@ -291,10 +234,11 @@ export function taskOf(prompt: string): string {
 }
 
 /** What the row's second line says: the action, then the todo in progress or the last thing it said. */
-export function nowOf(row: AgentRow): string {
-  const detail = row.todos.find(t => t.status === 'in_progress')?.activeForm ?? row.said
+export function nowOf(row: AgentRow, short: (text: string) => string = t => t): string {
+  const raw = row.todos.find(t => t.status === 'in_progress')?.activeForm ?? row.said
+  const detail = raw ? short(raw) : raw
   if (row.status === 'running') return [row.doing, detail].filter(Boolean).join(' · ') || 'working'
-  return [activityOf(row), row.said].filter(Boolean).join(' · ')
+  return [activityOf(row), row.said ? short(row.said) : ''].filter(Boolean).join(' · ')
 }
 
 /** "quiet 45s" once a running agent has shown nothing for 30s; amber from 2 minutes. */
@@ -407,4 +351,150 @@ export function cacheText(s: CacheStatus, maxChars: number): string {
         ? [`expired · next request re-caches ${tok} tok · ~${usd} extra`, `expired · ~${usd} extra`, 'expired']
         : [`may have expired (TTL unknown) · ~${usd} extra if so`, `may be expired · ~${usd} extra`, 'may be expired']
   return variants.find(v => v.length <= maxChars) ?? variants[variants.length - 1] ?? ''
+}
+
+const isTodoStatus = (s: unknown): s is Todo['status'] => s === 'pending' || s === 'in_progress' || s === 'completed'
+const text = (v: unknown): string => (typeof v === 'string' ? v : '')
+
+/**
+ * The newer task tools (TaskCreate, TaskUpdate, TaskList) change one task per call, and the id comes
+ * back in the result, so the list is rebuilt from the calls. TodoWrite sends the whole list instead.
+ */
+export function applyTaskCreate(todos: readonly Todo[], created: { id: string; subject: string }, input: { activeForm?: unknown }): Todo[] {
+  if (todos.some(t => t.id === created.id)) return [...todos]
+  const activeForm = text(input.activeForm)
+  return [...todos, { id: created.id, content: created.subject, status: 'pending', ...(activeForm ? { activeForm } : {}) }]
+}
+
+/** A TaskUpdate: `deleted` removes the task; anything else changes only what the call names. An unknown id is ignored. */
+export function applyTaskUpdate(
+  todos: readonly Todo[],
+  input: { taskId: string; subject?: unknown; activeForm?: unknown; status?: unknown },
+): Todo[] {
+  if (input.status === 'deleted') return todos.filter(t => t.id !== input.taskId)
+  return todos.map(t =>
+    t.id !== input.taskId
+      ? t
+      : {
+          ...t,
+          content: text(input.subject) || t.content,
+          status: isTodoStatus(input.status) ? input.status : t.status,
+          ...(text(input.activeForm) || t.activeForm ? { activeForm: text(input.activeForm) || t.activeForm } : {}),
+        },
+  )
+}
+
+/** A TaskList result is the whole list again: take its order and statuses, keep the activeForm we already knew. */
+export function applyTaskList(todos: readonly Todo[], tasks: ReadonlyArray<{ id: string; subject: string; status?: string }>): Todo[] {
+  const known = new Map(todos.map(t => [t.id, t] as const))
+  return tasks.map(x => {
+    const activeForm = known.get(x.id)?.activeForm
+    return { id: x.id, content: x.subject, status: isTodoStatus(x.status) ? x.status : 'pending', ...(activeForm ? { activeForm } : {}) }
+  })
+}
+
+const FINISHED = /^(completed|complete|done|failed|killed|stopped|cancelled|canceled|error)$/i
+
+/** A background task's label: its description's first line, clipped; never its command line. */
+export function bgLabelOf(description: string, kind: string): string {
+  const first = description.split('\n').find(l => l.trim() !== '')?.replace(/\s+/g, ' ').trim() ?? ''
+  return first ? clipText(first, 60) : kind
+}
+
+/** A shell or monitor started in the background (from a tool result), before any snapshot lists it. */
+export function noteBackground(
+  prev: Readonly<Record<string, BgTask>>,
+  t: { id: string; kind: string; label: string },
+  now: number,
+): Record<string, BgTask> {
+  return prev[t.id] ? { ...prev } : { ...prev, [t.id]: { id: t.id, kind: t.kind, label: t.label, status: 'running', startedAt: now } }
+}
+
+/**
+ * Reconcile with the engine's own list of running background tasks (what a Stop hook is given): listed
+ * ones are running, known ones no longer listed have finished. Finished ones go after `keepMs`.
+ */
+export function syncBackground(
+  prev: Readonly<Record<string, BgTask>>,
+  snapshot: ReadonlyArray<{ id: string; type: string; status: string; description: string }>,
+  now: number,
+  keepMs = 60_000,
+): Record<string, BgTask> {
+  const next: Record<string, BgTask> = { ...prev }
+  const live = new Set<string>()
+  for (const t of snapshot) {
+    if (FINISHED.test(t.status)) continue
+    live.add(t.id)
+    next[t.id] = { id: t.id, kind: t.type, label: bgLabelOf(t.description, t.type), status: 'running', startedAt: prev[t.id]?.startedAt ?? now }
+  }
+  for (const [id, b] of Object.entries(next)) {
+    if (b.status === 'running' && !live.has(id)) next[id] = { ...b, status: 'done', endedAt: now }
+    else if (b.status === 'done' && now - (b.endedAt ?? now) > keepMs) delete next[id]
+  }
+  return next
+}
+
+/** Rows for the band: running first, then recently finished; subagents are agents and show there instead. */
+export function backgroundRows(all: Readonly<Record<string, BgTask>>): BgTask[] {
+  return Object.values(all)
+    .filter(b => b.kind !== 'subagent')
+    .sort((a, b) => (a.status === b.status ? b.startedAt - a.startedAt : a.status === 'running' ? -1 : 1))
+}
+
+/** A window of `height` lines over `total`, its offset clamped; whether it can move up or down. */
+export function scrollWindow(total: number, offset: number, height: number): { offset: number; canUp: boolean; canDown: boolean } {
+  const max = Math.max(0, total - height)
+  const o = Math.min(max, Math.max(0, Math.round(offset)))
+  return { offset: o, canUp: o > 0, canDown: o < max }
+}
+
+const FILLER = /^(?:(?:ok(?:ay)?|alright|great|now|so|next|first|then)[,.!]?\s+)*(?:(?:i(?:'ll| will| am going to|'m going to| need to)|let me|let's|we(?:'ll| will| need to)|going to)\s+)?/i
+
+/**
+ * A commit-subject-sized version of a sentence, made locally while the model's own rewrite is on its way: the
+ * first sentence, leading filler ("Now I'll", "Let me") dropped, capitalised, at most `maxWords` words.
+ */
+export function shortOf(text: string, maxWords = 7): string {
+  const line = text.split('\n').find(l => l.trim() !== '') ?? ''
+  const first = line.replace(/\s+/g, ' ').trim().split(/(?<=[.!?:;])\s/)[0] ?? ''
+  const core = first.replace(FILLER, '').replace(/[.!?:;,]+$/, '').trim()
+  if (!core) return ''
+  const words = core.split(' ')
+  const cut = words.slice(0, maxWords).join(' ') + (words.length > maxWords ? '…' : '')
+  return cut.charAt(0).toUpperCase() + cut.slice(1)
+}
+
+/** The model's reply cleaned into a subject: first line, no quotes or trailing period, at most 60 characters. */
+export function subjectOf(reply: string): string {
+  const line = (reply.split('\n').find(l => l.trim() !== '') ?? '').trim()
+  const bare = line.replace(/^["'`*\s]+|["'`*\s]+$/g, '').replace(/^subject:\s*/i, '').replace(/[.]+$/, '').trim()
+  return clipText(bare, 60)
+}
+
+/** The key a brief is stored under: the text itself, bounded. */
+export const briefKey = (text: string): string => text.replace(/\s+/g, ' ').trim().slice(0, 300)
+
+/**
+ * A Claude model id as a short name: `claude-opus-5-5` becomes `Opus5.5`. Handles the family-first ids
+ * (`claude-sonnet-5-5`, `claude-opus-4-1-20250805`) and the older version-first ones (`claude-3-5-sonnet-20241022`).
+ * Anything else is returned unchanged.
+ */
+export function modelName(id: string): string {
+  const family = (f: string): string => f.charAt(0).toUpperCase() + f.slice(1).toLowerCase()
+  const v = (major: string, minor?: string): string => (minor ? `${major}.${minor}` : major)
+  const next = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/i.exec(id.trim())
+  if (next?.[1] && next[2]) return `${family(next[1])}${v(next[2], next[3])}`
+  const old = /^claude-(\d+)(?:-(\d{1,2})(?!\d))?-(opus|sonnet|haiku|fable)/i.exec(id.trim())
+  if (old?.[1] && old[3]) return `${family(old[3])}${v(old[1], old[2])}`
+  return id
+}
+
+/**
+ * The engine's prompt hint line (`▸▸ auto mode on (shift+tab to cycle) · ← for agents · ↓ to manage`) as one line
+ * that fits `room`: whitespace collapsed, then trailing " · " parts dropped until it fits, else clipped.
+ */
+export function hintLine(hint: string, room: number): string {
+  const parts = hint.replace(/\s+/g, ' ').trim().split(' · ').filter(Boolean)
+  while (parts.length > 1 && parts.join(' · ').length > room) parts.pop()
+  return clipText(parts.join(' · '), Math.max(1, room))
 }
