@@ -8,4 +8,4 @@ the detail.
 3. Never edit or commit `.claude-plugin/types/` (engine-generated).
 4. The module runs without DOM or Node; use `$` only.
 5. Before finishing: `claude plugin validate .` and `claude plugin test .` pass.
-6. Do not show tool counts or command text in the pane; costs are labelled estimates, never a bill.
+6. Do not show tool counts or command text in the band (generic action labels such as "reading files" are fine); costs are labelled estimates, never a bill.

@@ -4,11 +4,16 @@
   "description": "Pane showing every agent's activity, progress, model/effort, tokens, equivalent cost, what is left to do, and remaining rate-limit quota.",
   "types": "./types/index.d.ts",
   "userConfig": {
-    "compactToolRows": {
-      "type": "boolean",
-      "title": "Compact tool rows in the transcript",
-      "description": "Show ordinary tool calls as a single dim line with just the tool name (no command text). Errors, interruptions and permission prompts are never collapsed.",
-      "default": true
+    "toolRows": {
+      "type": "string",
+      "title": "Tool rows in the transcript",
+      "description": "hidden: ordinary tool calls and their output are not shown (the band above the prompt shows progress). compact: one dim line per call. full: the engine's own rows. Errors, interruptions and permission prompts always show.",
+      "options": [
+        "hidden",
+        "compact",
+        "full"
+      ],
+      "default": "hidden"
     },
     "planFile": {
       "type": "string",
