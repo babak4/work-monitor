@@ -1,0 +1,4 @@
+# written by the Claude Code engine when it loads the mod; regenerated, never edit
+.claude-plugin/types/
+node_modules/
+.DS_Store

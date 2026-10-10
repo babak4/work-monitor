@@ -1,0 +1,26 @@
+{
+  "name": "work-monitor",
+  "version": "0.1.0",
+  "description": "Pane showing every agent's activity, progress, model/effort, tokens, equivalent cost, what is left to do, and remaining rate-limit quota.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "compactToolRows": {
+      "type": "boolean",
+      "title": "Compact tool rows in the transcript",
+      "description": "Show ordinary tool calls as a single dim line with just the tool name (no command text). Errors, interruptions and permission prompts are never collapsed.",
+      "default": true
+    },
+    "planFile": {
+      "type": "string",
+      "title": "Plan checklist file",
+      "description": "Markdown checklist (- [ ] / - [x]) read from the working directory to show what is left to do.",
+      "default": "docs/PROGRESS.md"
+    },
+    "prices": {
+      "type": "string",
+      "title": "Price table (USD per million tokens)",
+      "description": "JSON: {\"opus\":{\"in\":5,\"out\":25},\"sonnet\":{\"in\":3,\"out\":15}, ...}. Cache read is 0.1x input and cache write 1.25x unless given as cr/cw. Defaults are ASSUMPTIONS; edit them to your plan's real rates.",
+      "default": ""
+    }
+  }
+}

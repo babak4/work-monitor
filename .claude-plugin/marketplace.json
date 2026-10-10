@@ -1,0 +1,11 @@
+{
+  "name": "work-monitor-local",
+  "owner": { "name": "babak" },
+  "plugins": [
+    {
+      "name": "work-monitor",
+      "source": "./",
+      "description": "Pane showing every agent's activity, progress, model/effort, tokens, equivalent cost, what is left to do, and remaining rate-limit quota."
+    }
+  ]
+}
