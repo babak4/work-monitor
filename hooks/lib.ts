@@ -1,4 +1,4 @@
-import type { AgentRow, AgentStatus, PlanClock, Todo, Tokens } from '../types'
+import type { AgentRow, AgentStatus, CacheState, PlanClock, Todo, Tokens } from '../types'
 
 export type Price = { in: number; out: number; cr?: number; cw?: number }
 export type PriceTable = Record<string, Price>
@@ -32,9 +32,15 @@ export function tierOf(model: string): string {
   return 'opus'
 }
 
+const LAST_RESORT_PRICE: Price = { in: 5, out: 25 }
+
+/** The price row for a model: its tier's, else the opus tier's. */
+export const priceOf = (model: string, prices: PriceTable = DEFAULT_PRICES): Price =>
+  prices[tierOf(model)] ?? DEFAULT_PRICES.opus ?? LAST_RESORT_PRICE
+
 /** Equivalent API cost in USD for these tokens on this model. */
 export function costUsd(model: string, t: Tokens, prices: PriceTable = DEFAULT_PRICES): number {
-  const p = prices[tierOf(model)] ?? DEFAULT_PRICES.opus
+  const p = priceOf(model, prices)
   const cr = p.cr ?? p.in * 0.1
   const cw = p.cw ?? p.in * 1.25
   return (t.input * p.in + t.output * p.out + t.cacheRead * cr + t.cacheWrite * cw) / 1_000_000
@@ -127,14 +133,22 @@ export const toolRowModeOf = (raw: unknown): ToolRowMode =>
 export const isQuietGroup = (calls: ReadonlyArray<{ isErrored: boolean; isInterrupted: boolean }>): boolean =>
   calls.every(c => !c.isErrored && !c.isInterrupted)
 
+/** Below this many rows the cache and quota drop their boxes and take one plain line each. */
+export const BOXED_MIN_ROWS = 14
+
 /**
- * How many agents fit under the band's fixed rows. `costs` is the height of each agent in order
- * (its row, its now-line, plus detail lines when expanded). The border (2), the header (1), the quota
- * line (1), the plan line (1, when there is a plan) and `extraFixed` (the task line) come first; at
- * least one agent always shows.
+ * Rows the band spends before any agent: the border (2), the header (1), the cache and quota (a
+ * 3-row box each, or 1 plain line each when short), and the plan and Task lines when present.
  */
-export function fitAgentRows(maxRows: number, costs: readonly number[], hasPlan: boolean, extraFixed = 0): number {
-  let room = maxRows - (2 + 1 + 1 + (hasPlan ? 1 : 0) + extraFixed)
+export const bandFixedRows = (o: { boxed: boolean; hasPlan: boolean; hasTask: boolean }): number =>
+  2 + 1 + (o.boxed ? 6 : 2) + (o.hasPlan ? 1 : 0) + (o.hasTask ? 1 : 0)
+
+/**
+ * How many agents fit in `maxRows` once `fixedRows` are spent. `costs` is the height of each agent in
+ * order (its row, its now-line, plus detail lines when expanded); at least one agent always shows.
+ */
+export function fitAgentRows(maxRows: number, costs: readonly number[], fixedRows: number): number {
+  let room = maxRows - fixedRows
   let n = 0
   for (const c of costs) {
     if (n > 0 && c > room) break
@@ -318,4 +332,79 @@ export function fmtReset(iso: string | undefined, nowMs: number): string {
   const left = t - nowMs
   if (left <= 0) return 'resets now'
   return `resets in ${fmtDuration(left)}`
+}
+
+export type Ttl = '5m' | '1h'
+export const TTL_MS: Record<Ttl, number> = { '5m': 300_000, '1h': 3_600_000 }
+
+/** The `cacheTtl` option: a forced `5m` or `1h`, or null for `auto` (learn it from behaviour). */
+export const ttlOptionOf = (raw: unknown): Ttl | null => (raw === '5m' || raw === '1h' ? raw : null)
+
+/** Tokens the next request re-sends: this response's input, cache reads and writes, and its own output. */
+export const contextTokensOf = (u: Tokens): number => u.input + u.output + u.cacheRead + u.cacheWrite
+
+const TTL_MARGIN_MS = 15_000
+
+/**
+ * Learn the cache TTL from how a request fared after a gap. The API gives no TTL, but behaviour does:
+ * a request that read most of the earlier prefix after more than five minutes proves the 1h TTL; a
+ * request that had to re-write it after five to fifty-five minutes suggests 5m, trusted only while
+ * nothing is known (a miss also follows a changed prompt or model). "Most" is half, so a small
+ * separately-cached prefix such as the system prompt cannot pass for the conversation.
+ */
+export function inferTtl(prev: Ttl | null, gapMs: number | null, prevTokens: number, used: Tokens): Ttl | null {
+  if (gapMs === null || prevTokens <= 0 || gapMs <= TTL_MS['5m'] + TTL_MARGIN_MS) return prev
+  if (used.cacheRead >= prevTokens * 0.5) return '1h'
+  if (prev === null && used.cacheWrite > 0 && gapMs < TTL_MS['1h'] - 300_000) return '5m'
+  return prev
+}
+
+/** What losing a cache of `tokens` costs: re-writing it at the cache-write rate instead of reading it. */
+export function cacheLapse(
+  model: string,
+  tokens: number,
+  ttl: Ttl,
+  prices: PriceTable = DEFAULT_PRICES,
+): { readUsd: number; writeUsd: number; extraUsd: number } {
+  const p = priceOf(model, prices)
+  const cr = p.cr ?? p.in * 0.1
+  const cw = p.cw ?? p.in * (ttl === '1h' ? 2 : 1.25)
+  return { readUsd: (tokens * cr) / 1_000_000, writeUsd: (tokens * cw) / 1_000_000, extraUsd: (tokens * (cw - cr)) / 1_000_000 }
+}
+
+export type CacheStatus =
+  | { kind: 'none' }
+  | { kind: 'warm' | 'expired'; leftMs: number; fraction: number; tokens: number; extraUsd: number; ttl: Ttl; certain: boolean }
+
+/** The cache's standing now. `certain` is false while the TTL is only assumed (5m) rather than forced or learned. */
+export function cacheStatus(c: CacheState | null, forced: Ttl | null, now: number, prices: PriceTable = DEFAULT_PRICES): CacheStatus {
+  if (!c || c.lastAt <= 0) return { kind: 'none' }
+  const ttl = forced ?? c.ttl ?? '5m'
+  const leftMs = c.lastAt + TTL_MS[ttl] - now
+  return {
+    kind: leftMs > 0 ? 'warm' : 'expired',
+    leftMs: Math.max(0, leftMs),
+    fraction: Math.min(1, Math.max(0, leftMs / TTL_MS[ttl])),
+    tokens: c.tokens,
+    extraUsd: cacheLapse(c.model, c.tokens, ttl, prices).extraUsd,
+    ttl,
+    certain: forced !== null || c.ttl !== null,
+  }
+}
+
+/** The cache line's text after its "Cache" label: the fullest wording that fits `maxChars`, else the shortest. Costs are estimates (`~`). */
+export function cacheText(s: CacheStatus, maxChars: number): string {
+  if (s.kind === 'none') return 'no reading yet'
+  const usd = fmtUsd(s.extraUsd)
+  const tok = fmtTokens(s.tokens)
+  const variants =
+    s.kind === 'warm'
+      ? (() => {
+          const t = `${s.certain ? '' : '~'}${fmtDuration(s.leftMs)}`
+          return [`${t} left · ~${usd} extra if it lapses · ${tok} tok`, `${t} left · ~${usd} extra if lost`, `${t} · ~${usd} at risk`, t]
+        })()
+      : s.certain
+        ? [`expired · next request re-caches ${tok} tok · ~${usd} extra`, `expired · ~${usd} extra`, 'expired']
+        : [`may have expired (TTL unknown) · ~${usd} extra if so`, `may be expired · ~${usd} extra`, 'may be expired']
+  return variants.find(v => v.length <= maxChars) ?? variants[variants.length - 1] ?? ''
 }

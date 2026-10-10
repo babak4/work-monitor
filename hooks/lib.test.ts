@@ -17,6 +17,15 @@ import {
   toolRowModeOf,
   isQuietGroup,
   fitAgentRows,
+  bandFixedRows,
+  BOXED_MIN_ROWS,
+  ttlOptionOf,
+  contextTokensOf,
+  inferTtl,
+  cacheLapse,
+  cacheStatus,
+  cacheText,
+  TTL_MS,
   doingOf,
   sayingOf,
   taskOf,
@@ -133,14 +142,21 @@ test('isQuietGroup keeps groups holding a failure', () => {
   expect(isQuietGroup([{ isErrored: false, isInterrupted: true }])).toBe(false)
 })
 
-test('fitAgentRows fits agents, expanded ones included, under the fixed rows', () => {
-  expect(fitAgentRows(20, [1, 1, 1], true)).toBe(3)
-  expect(fitAgentRows(8, [1, 1, 1, 1, 1], true)).toBe(3)
-  expect(fitAgentRows(8, [1, 1, 1, 1, 1], false)).toBe(4)
-  expect(fitAgentRows(8, [1, 4, 1], true)).toBe(1)
-  expect(fitAgentRows(4, [3, 1], true)).toBe(1)
-  expect(fitAgentRows(10, [], true)).toBe(0)
-  expect(fitAgentRows(8, [2, 2, 2], true, 1)).toBe(1)
+test('bandFixedRows counts the border, header, boxes or lines, plan and task', () => {
+  expect(bandFixedRows({ boxed: true, hasPlan: false, hasTask: false })).toBe(9)
+  expect(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true })).toBe(11)
+  expect(bandFixedRows({ boxed: false, hasPlan: false, hasTask: false })).toBe(5)
+  expect(bandFixedRows({ boxed: false, hasPlan: true, hasTask: true })).toBe(7)
+  expect(BOXED_MIN_ROWS).toBeGreaterThan(bandFixedRows({ boxed: true, hasPlan: true, hasTask: true }) + 2)
+})
+
+test('fitAgentRows fits agents, expanded ones included, after the fixed rows', () => {
+  expect(fitAgentRows(20, [2, 2, 2], 5)).toBe(3)
+  expect(fitAgentRows(11, [2, 2, 2, 2, 2], 5)).toBe(3)
+  expect(fitAgentRows(11, [2, 5, 2], 5)).toBe(1)
+  expect(fitAgentRows(4, [3, 2], 5)).toBe(1)
+  expect(fitAgentRows(10, [], 5)).toBe(0)
+  expect(fitAgentRows(14, [2, 2, 2], 11)).toBe(1)
 })
 
 test('smoothBar is always the requested width and fills in eighths', () => {
@@ -242,4 +258,74 @@ test('an agent awaits its first reading until it has a model or tokens', () => {
   expect(isAwaitingFirstReading(agentRow({ model: '?' }))).toBe(true)
   expect(isAwaitingFirstReading(agentRow({ model: 'opus' }))).toBe(false)
   expect(isAwaitingFirstReading(agentRow({ model: '?', tokens: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }))).toBe(false)
+})
+
+const tk = (o: Partial<{ input: number; output: number; cacheRead: number; cacheWrite: number }> = {}) => ({
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...o,
+})
+
+test('ttlOptionOf forces only 5m or 1h', () => {
+  expect(ttlOptionOf('5m')).toBe('5m')
+  expect(ttlOptionOf('1h')).toBe('1h')
+  expect(ttlOptionOf('auto')).toBe(null)
+  expect(ttlOptionOf(undefined)).toBe(null)
+})
+
+test('contextTokensOf is everything the next request re-sends', () => {
+  expect(contextTokensOf(tk({ input: 10, output: 20, cacheRead: 300, cacheWrite: 4000 }))).toBe(4330)
+})
+
+test('inferTtl learns 1h from a hit after a long gap and 5m from a miss, never from a short gap', () => {
+  const min = 60_000
+  expect(inferTtl(null, 2 * min, 100_000, tk({ cacheRead: 100_000 }))).toBe(null)
+  expect(inferTtl(null, 20 * min, 100_000, tk({ cacheRead: 90_000 }))).toBe('1h')
+  expect(inferTtl('5m', 20 * min, 100_000, tk({ cacheRead: 90_000 }))).toBe('1h')
+  // a small separately-cached prefix is not the conversation
+  expect(inferTtl(null, 20 * min, 100_000, tk({ cacheRead: 8_000, cacheWrite: 92_000 }))).toBe('5m')
+  expect(inferTtl('1h', 20 * min, 100_000, tk({ cacheRead: 8_000, cacheWrite: 92_000 }))).toBe('1h')
+  // a miss near or past the hour proves nothing about 5m
+  expect(inferTtl(null, 58 * min, 100_000, tk({ cacheWrite: 100_000 }))).toBe(null)
+  expect(inferTtl(null, null, 0, tk({ cacheRead: 5 }))).toBe(null)
+})
+
+test('cacheLapse prices the re-write against the read, 2x input for a 1h cache', () => {
+  const l5 = cacheLapse('claude-opus-5-5', 1_000_000, '5m')
+  expect(near(l5.readUsd, 0.5)).toBe(true)
+  expect(near(l5.writeUsd, 6.25)).toBe(true)
+  expect(near(l5.extraUsd, 5.75)).toBe(true)
+  expect(near(cacheLapse('claude-opus-5-5', 1_000_000, '1h').writeUsd, 10)).toBe(true)
+  // an explicit price-table cw wins over the TTL multiplier
+  expect(near(cacheLapse('opus', 1_000_000, '1h', { opus: { in: 5, out: 25, cw: 7 } }).writeUsd, 7)).toBe(true)
+})
+
+test('cacheStatus counts down from the last touch and says when the TTL is only assumed', () => {
+  const c = { lastAt: 1_000, tokens: 200_000, model: 'claude-opus-5-5', ttl: null }
+  expect(cacheStatus(null, null, 5_000).kind).toBe('none')
+  const warm = cacheStatus(c, null, 1_000 + 100_000)
+  expect(warm.kind).toBe('warm')
+  if (warm.kind !== 'none') {
+    expect(warm.leftMs).toBe(200_000)
+    expect(near(warm.fraction, 200_000 / TTL_MS['5m'])).toBe(true)
+    expect(warm.certain).toBe(false)
+  }
+  expect(cacheStatus(c, null, 1_000 + 400_000).kind).toBe('expired')
+  const forced = cacheStatus(c, '1h', 1_000 + 400_000)
+  expect(forced.kind).toBe('warm')
+  if (forced.kind !== 'none') expect(forced.certain).toBe(true)
+  expect(cacheStatus({ ...c, ttl: '1h' }, null, 1_000 + 400_000).kind).toBe('warm')
+})
+
+test('cacheText picks the fullest wording that fits, after the Cache label', () => {
+  const s = cacheStatus({ lastAt: 0.5, tokens: 200_000, model: 'claude-opus-5-5', ttl: '5m' }, null, 0.5 + 100_000)
+  expect(cacheText(s, 200)).toBe('3m20s left · ~$1.15 extra if it lapses · 200.0k tok')
+  expect(cacheText(s, 40)).toBe('3m20s left · ~$1.15 extra if lost')
+  expect(cacheText(s, 30)).toBe('3m20s · ~$1.15 at risk')
+  expect(cacheText(s, 5)).toBe('3m20s')
+  const guess = cacheStatus({ lastAt: 0.5, tokens: 200_000, model: 'claude-opus-5-5', ttl: null }, null, 0.5 + 100_000)
+  expect(cacheText(guess, 200).startsWith('~3m20s left')).toBe(true)
+  const gone = cacheStatus({ lastAt: 0.5, tokens: 200_000, model: 'claude-opus-5-5', ttl: '5m' }, null, 0.5 + 400_000)
+  expect(cacheText(gone, 200)).toBe('expired · next request re-caches 200.0k tok · ~$1.15 extra')
+  expect(cacheText(gone, 30)).toBe('expired · ~$1.15 extra')
+  expect(cacheText(cacheStatus({ lastAt: 0.5, tokens: 1, model: 'x', ttl: null }, null, 0.5 + 400_000), 200)).toContain('TTL unknown')
+  expect(cacheText({ kind: 'none' }, 10)).toBe('no reading yet')
 })

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, AgentStatus, PlanClock, Quota, Todo } from '../types'
+import type { AgentRow, AgentStatus, CacheState, PlanClock, Quota, Todo } from '../types'
 import {
   addTokens,
   costUsd,
@@ -11,7 +11,14 @@ import {
   fmtReset,
   fmtTokens,
   fmtUsd,
+  BOXED_MIN_ROWS,
+  bandFixedRows,
   bandState,
+  cacheStatus,
+  cacheText,
+  contextTokensOf,
+  inferTtl,
+  ttlOptionOf,
   etaMs,
   fitAgentRows,
   heat,
@@ -46,6 +53,7 @@ const checklistA = atom({ plugin: 'work-monitor', key: 'checklist' } as const, [
 const nowA = atom({ plugin: 'work-monitor', key: 'now' } as const, 0)
 const hiddenA = atom({ plugin: 'work-monitor', key: 'isHidden' } as const, false)
 const expandedA = atom({ plugin: 'work-monitor', key: 'expanded' } as const, {} as Record<string, boolean>)
+const cacheA = atom({ plugin: 'work-monitor', key: 'cache' } as const, null as CacheState | null)
 const planClockA = atom({ plugin: 'work-monitor', key: 'planClock' } as const, null as PlanClock | null)
 
 // Navy band palette: every Text sets one of these, none relies on the terminal's default colour.
@@ -176,6 +184,7 @@ async function tick($: Dollar): Promise<void> {
 export const register: Register = (on, options) => {
   const prices = parsePrices(options.prices)
   const toolRows = toolRowModeOf(options.toolRows)
+  const forcedTtl = ttlOptionOf(options.cacheTtl)
   const planFile = typeof options.planFile === 'string' && options.planFile ? options.planFile : 'docs/PROGRESS.md'
 
   on('session.start', async ($, e, next) => {
@@ -220,6 +229,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const id = e.agentId ?? MAIN
     const effort = e.effort === undefined ? '—' : String(e.effort)
+    const startedAt = await $.clock.now() // a cache entry's life runs from when the request used it
     await touch($, id, (row, now) => ({
       ...row,
       model: e.model,
@@ -256,6 +266,23 @@ export const register: Register = (on, options) => {
       const said = sayingOf(result.answer)
       const first = result.toolUses[0]
       const u = result.usage
+      if (u && !e.agentId) {
+        const used = {
+          input: u.input_tokens,
+          output: u.output_tokens,
+          cacheRead: u.cache_read_input_tokens,
+          cacheWrite: u.cache_creation_input_tokens,
+        }
+        // A request that read or wrote cache restarts its clock; one that touched none leaves it as it was.
+        if (used.cacheRead + used.cacheWrite > 0) {
+          await update($, cacheA, prev => ({
+            lastAt: startedAt,
+            tokens: contextTokensOf(used),
+            model: e.model,
+            ttl: inferTtl(prev?.ttl ?? null, prev ? startedAt - prev.lastAt : null, prev?.tokens ?? 0, used),
+          }))
+        }
+      }
       await touch($, id, (row, now) => ({
         ...row,
         said: said || row.said,
@@ -334,6 +361,7 @@ export const register: Register = (on, options) => {
     const ledgerUsd = await read($, usdA)
     const checklist = await read($, checklistA)
     const planClock = await read($, planClockA)
+    const cache = await read($, cacheA)
     const expanded = await read($, expandedA)
     const now = (await read($, nowA)) || 0
 
@@ -360,27 +388,76 @@ export const register: Register = (on, options) => {
 
     const details = new Map(sorted.filter(a => expanded[a.id]).map(a => [a.id, detailOf(a, cols)] as const))
     const task = agents.find(a => a.isMain)?.task
+    // Cache and quota are boxes of their own when the band is tall enough, plain lines when it is short.
+    const boxed = e.props.maxRows >= BOXED_MIN_ROWS
     const shown = fitAgentRows(
       e.props.maxRows,
       sorted.map(a => 2 + (details.get(a.id)?.length ?? 0)),
-      planFraction !== null,
-      task ? 1 : 0,
+      bandFixedRows({ boxed, hasPlan: planFraction !== null, hasTask: Boolean(task) }),
     )
     const barW = Math.min(12, Math.max(6, Math.floor(cols / 10)))
     const labelW = Math.max(12, Math.min(28, Math.floor(cols / 4)))
+
+    // Header: title and state on the left, session totals on the right; ledger gives way first.
+    const headIcon = state === 'working' ? spin : state === 'done' ? '✓' : state === 'failed' ? '✗' : '◆'
+    const leftLen = `${headIcon} Work monitor${running > 0 ? `  ${running} running` : '  idle'}`.length
+    const rightBase = `${fmtTokens(totalTokens(total))} tok · ~${fmtUsd(estUsd)}`
+    const ledgerLen = ledgerUsd !== null ? ` · ledger ${fmtUsd(ledgerUsd)}`.length : 0
+    const showLedger = ledgerUsd !== null && cols - leftLen - rightBase.length - ledgerLen >= 4
+
+    // Cache: the countdown bar and the fullest wording that fits beside the label (box: border and padding take 4).
+    const cs = cacheStatus(cache, forcedTtl, now, prices)
+    const cacheBarW = cs.kind === 'warm' ? 8 : 0
+    const cacheRoom = cols - (boxed ? 4 : 0) - 'Cache '.length - (cacheBarW ? cacheBarW + 1 : 0)
+    const cacheTone = cs.kind === 'warm' ? heat(cs.fraction) : cs.kind === 'expired' ? (cs.certain ? C.bad : C.warn) : C.dim
+    const cacheContent = (
+      <Text wrap="truncate-end">
+        <Text bold color={ORANGE}>Cache </Text>
+        {cs.kind === 'warm' ? <Text color={cacheTone}>{smoothBar(cs.fraction, cacheBarW)} </Text> : ''}
+        <Text color={cs.kind === 'expired' ? cacheTone : C.text}>{cacheText(cs, cacheRoom)}</Text>
+      </Text>
+    )
+
+    // Quota: one entry per rate-limit window; the box takes the colour of the scarcest.
+    const quotaTone = quotas.length === 0 ? C.dim : heat(Math.min(...quotas.map(q => Math.max(0, 100 - q.percentUsed))) / 100)
+    const quotaContent = (
+      <Text color={C.dim} wrap="truncate-end">
+        <Text bold color={ORANGE}>Quota </Text>
+        {quotas.length === 0
+          ? 'no rate-limit windows reported'
+          : quotas.map((q, i) => {
+              const left = Math.max(0, 100 - q.percentUsed)
+              return (
+                <Text color={heat(left / 100)}>
+                  {i > 0 ? '   ' : ''}
+                  {quotaLabel(q.kind)} {smoothBar(left / 100, Math.max(4, barW - 4))} {left.toFixed(0)}%
+                  <Text color={C.dim}> {fmtReset(q.resetsAt, now).replace('resets in ', '↻')}</Text>
+                </Text>
+              )
+            })}
+      </Text>
+    )
 
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={edge} backgroundColor={NAVY} width={width} paddingX={1}>
         <Box justifyContent="space-between">
           <Text bold color={edge}>
-            {state === 'working' ? spin : state === 'done' ? '✓' : state === 'failed' ? '✗' : '◆'} Work monitor
+            {headIcon} Work monitor
             <Text color={C.dim}>{running > 0 ? `  ${running} running` : '  idle'}</Text>
           </Text>
           <Text color={C.text}>
             {fmtTokens(totalTokens(total))} tok · <Text color={C.warn}>~{fmtUsd(estUsd)}</Text>
-            {ledgerUsd !== null ? <Text color={C.dim}> · ledger {fmtUsd(ledgerUsd)}</Text> : ''}
+            {showLedger ? <Text color={C.dim}> · ledger {fmtUsd(ledgerUsd ?? 0)}</Text> : ''}
           </Text>
         </Box>
+
+        {boxed ? (
+          <Box key="cache-box" borderStyle="round" borderColor={cacheTone} backgroundColor={NAVY} paddingX={1}>
+            {cacheContent}
+          </Box>
+        ) : (
+          cacheContent
+        )}
 
         {task && (
           <Text wrap="truncate-end">
@@ -441,22 +518,13 @@ export const register: Register = (on, options) => {
           </Text>
         )}
 
-        <Text color={C.dim} wrap="truncate-end">
-          <Text bold color={ORANGE}>Quota </Text>
-          {quotas.length === 0
-            ? 'no rate-limit windows reported'
-            : quotas.map((q, i) => {
-                const left = Math.max(0, 100 - q.percentUsed)
-                const tone = heat(left / 100)
-                return (
-                  <Text color={tone}>
-                    {i > 0 ? '  ' : ''}
-                    {quotaLabel(q.kind)} {smoothBar(left / 100, Math.max(4, barW - 4))} {left.toFixed(0)}%
-                    <Text color={C.dim}> {fmtReset(q.resetsAt, now).replace('resets in ', '↻')}</Text>
-                  </Text>
-                )
-              })}
-        </Text>
+        {boxed ? (
+          <Box key="quota-box" borderStyle="round" borderColor={quotaTone} backgroundColor={NAVY} paddingX={1}>
+            {quotaContent}
+          </Box>
+        ) : (
+          quotaContent
+        )}
       </Box>
     )
   })
